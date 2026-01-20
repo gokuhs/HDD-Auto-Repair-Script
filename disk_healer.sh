@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ? DISK HEALER v6.1 - STABLE UI (ASCII & STATIC REFRESH)
-#  Corregido: Caracteres compatibles, contador real y tabla estática.
+#  ? DISK HEALER v6.2 - ROBUST UI FIX
+#  Corrección: Error printf, variables vacías y limpieza visual (anti-ghosting)
 # ==============================================================================
 
 # --- CONFIG ---
@@ -28,10 +28,13 @@ W='\033[1;37m'   # Blanco
 GR='\033[0;90m'  # Gris
 NC='\033[0m'     # Reset
 
-# Variables de Sesión
+# Variables Globales (Inicialización explícita)
 SESSION_START_TIME=$(date +%s)
 SESSION_START_SECTOR=0
-TOTAL_PENDING_COUNT=0 
+TOTAL_SALVADOS=0
+TOTAL_CEROS=0
+TOTAL_FALLIDOS=0
+SECTOR_ACTUAL=0
 
 # --- IDIOMA ---
 detect_language() {
@@ -80,13 +83,16 @@ format_seconds() {
 }
 
 get_pending_count() {
-    # Cuenta líneas en el archivo temporal actual y en el archivo de pendientes global
     local c1=0
     local c2=0
-    if [ -f "$TEMP_LIST" ]; then c1=$(grep -cve '^\s*$' "$TEMP_LIST" || echo 0); fi
-    if [ -f "$PENDING_FILE" ]; then c2=$(grep -cve '^\s*$' "$PENDING_FILE" || echo 0); fi
-    # Si estamos dentro del loop de reparación, restamos 1 (el actual que ya no está en la lista pero se está procesando)
-    # Pero para simplificar visualmente, la suma directa suele ser suficiente referencia
+    # Aseguramos que grep devuelva 0 si falla o no encuentra nada
+    if [ -f "$TEMP_LIST" ]; then 
+        c1=$(grep -cve '^\s*$' "$TEMP_LIST" 2>/dev/null || echo 0)
+    fi
+    if [ -f "$PENDING_FILE" ]; then 
+        c2=$(grep -cve '^\s*$' "$PENDING_FILE" 2>/dev/null || echo 0)
+    fi
+    # Aritmética segura
     echo $((c1 + c2))
 }
 
@@ -108,24 +114,23 @@ if [ "$EUID" -ne 0 ]; then echo "Root required"; exit 1; fi
 DISCO=$1
 if [ -z "$DISCO" ]; then echo "Uso: $0 <device>"; exit 1; fi
 
-# --- MOTOR GRÁFICO (Dibuja toda la pantalla de una vez) ---
+# --- MOTOR GRÁFICO ---
 
 draw_screen() {
-    local mode=$1        # "SCAN" o "REPAIR"
+    local mode=$1        
     local sector=$2
     local total=$3
     local spinner=$4
     local status_msg=$5
     
-    # Datos específicos de reparación
     local r_sector=$6
     local st_read=$7
     local st_resc=$8
     local st_patch=$9
     local r_msg=${10}
 
-    # Cálculos Generales
-    local percent=$(echo "scale=2; $sector * 100 / $total" | bc)
+    # Cálculos seguros (con defaults a 0)
+    local percent=$(echo "scale=2; ${sector:-0} * 100 / ${total:-1}" | bc)
     local pending=$(get_pending_count)
     
     # Cálculo ETA
@@ -138,29 +143,36 @@ draw_screen() {
     
     if [ $elapsed -gt 5 ] && [ $sectors_done -gt 0 ]; then
         speed=$((sectors_done / elapsed))
-        local remaining=$((total - sector))
-        local eta_seconds=$((remaining / speed))
-        eta_str=$(format_seconds $eta_seconds)
-        finish_str=$(date -d "+$eta_seconds seconds" +"%H:%M")
+        if [ $speed -gt 0 ]; then
+            local remaining=$((total - sector))
+            local eta_seconds=$((remaining / speed))
+            eta_str=$(format_seconds $eta_seconds)
+            finish_str=$(date -d "+$eta_seconds seconds" +"%H:%M")
+        fi
         if [ "$pending" -gt 0 ]; then eta_str="$eta_str $L_PLUS_REPAIR"; fi
     fi
 
-    # --- INICIO PINTADO ---
-    # Mover cursor a HOME (0,0) para sobrescribir todo sin scroll
-    printf "\033[H"
+    # --- PINTADO ---
+    printf "\033[H" # Mover a Home
 
-    # 1. HEADER (ASCII Box)
-    echo -e "${B}+------------------------------------------------------------------------+${NC}"
-    printf "${B}|${NC} %-25s ${GR}|${NC} %-41s ${B}|${NC}\n" "${W}DISK HEALER v6.1${NC}" "${C}$DISCO${NC}"
-    echo -e "${B}+------------------------------------------------------------------------+${NC}"
-    printf "${B}|${NC} ${G}%-10s${NC} : %-4d ${GR}|${NC} ${Y}%-10s${NC} : %-4d ${GR}|${NC} ${R}%-10s${NC} : %-4d ${GR}|${NC} ${P}%-10s${NC} : %-4d ${B}|${NC}\n" \
-           "$L_SAVED" "$TOTAL_SALVADOS" "$L_ZEROS" "$TOTAL_CEROS" "$L_FAIL" "$TOTAL_FALLIDOS" "$L_PEND" "$pending"
-    echo -e "${B}+------------------------------------------------------------------------+${NC}"
-    printf "${B}|${NC} %-10s : %-7s ${GR}|${NC} %-10s : %-19s ${GR}|${NC} %-10s : %-5s ${B}|${NC}\n" \
+    # Header Box (Con \033[K al final para limpiar residuos)
+    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
+    printf "${B}|${NC} %-25s ${GR}|${NC} %-41s ${B}|${NC}\033[K\n" "${W}DISK HEALER v6.2${NC}" "${C}$DISCO${NC}"
+    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
+    
+    # Fila Stats (Aquí fallaba antes: añadimos :-0 para evitar vacíos)
+    printf "${B}|${NC} ${G}%-10s${NC} : %-4d ${GR}|${NC} ${Y}%-10s${NC} : %-4d ${GR}|${NC} ${R}%-10s${NC} : %-4d ${GR}|${NC} ${P}%-10s${NC} : %-4d ${B}|${NC}\033[K\n" \
+           "$L_SAVED" "${TOTAL_SALVADOS:-0}" \
+           "$L_ZEROS" "${TOTAL_CEROS:-0}" \
+           "$L_FAIL" "${TOTAL_FALLIDOS:-0}" \
+           "$L_PEND" "${pending:-0}"
+    
+    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
+    printf "${B}|${NC} %-10s : %-7s ${GR}|${NC} %-10s : %-19s ${GR}|${NC} %-10s : %-5s ${B}|${NC}\033[K\n" \
            "$L_SPEED" "${speed} s/s" "$L_ETA" "$eta_str" "$L_FINISH" "$finish_str"
-    echo -e "${B}+------------------------------------------------------------------------+${NC}"
+    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
 
-    # 2. PROGRESO GLOBAL
+    # Progreso Global
     local width=50
     local num_filled=$(echo "scale=0; $width * $percent / 100" | bc)
     local num_empty=$((width - num_filled))
@@ -168,18 +180,16 @@ draw_screen() {
     local empty=$(printf "%0.s." $(seq 1 $num_empty))
     
     echo ""
-    echo -e "${B}[${filled}${empty}]${NC} ${C}${percent}%${NC}"
-    echo -e "${P}[${spinner}]${NC} ${Y}$(printf "%'d" $sector)${NC} / $(printf "%'d" $total)"
+    echo -e "${B}[${filled}${empty}]${NC} ${C}${percent}%${NC}\033[K"
+    echo -e "${P}[${spinner}]${NC} ${Y}$(printf "%'d" $sector)${NC} / $(printf "%'d" $total)\033[K"
     
     if [ "$mode" == "SCAN" ]; then
         echo -e "${G}$L_SCAN${NC} - $status_msg\033[K"
-        # Limpiar líneas de abajo por si había una tarjeta de reparación antes
-        echo -e "\033[J" 
+        echo -e "\033[J" # Limpiar resto de pantalla hacia abajo
     else
-        # 3. TARJETA DE REPARACIÓN (Solo visible en modo REPAIR)
+        # Tarjeta Reparación
         echo -e "${R}$L_REPAIR${NC} >>> SECTOR: ${W}$r_sector${NC}\033[K"
         
-        # Iconos estado
         local i_pend="${GR}[ ]${NC}"
         local i_ok="${G}[OK]${NC}"
         local i_fail="${R}[FAIL]${NC}"
@@ -189,15 +199,15 @@ draw_screen() {
         local v_resc=$i_pend; [ $st_resc -eq 1 ] && v_resc=$i_try; [ $st_resc -eq 2 ] && v_resc=$i_ok; [ $st_resc -eq 3 ] && v_resc=$i_fail
         local v_patch=$i_pend; [ $st_patch -eq 1 ] && v_patch=$i_ok; [ $st_patch -eq 2 ] && v_patch=$i_fail
 
-        echo -e "${B}+--------------------------------------------------------+${NC}"
-        printf "${B}|${NC} %-18b %-18b %-18b ${B}|${NC}\n" "$v_read $L_PH_READ" "$v_resc $L_PH_RESC" "$v_patch $L_PH_ZERO"
-        echo -e "${B}+--------------------------------------------------------+${NC}"
+        echo -e "${B}+--------------------------------------------------------+${NC}\033[K"
+        printf "${B}|${NC} %-18b %-18b %-18b ${B}|${NC}\033[K\n" "$v_read $L_PH_READ" "$v_resc $L_PH_RESC" "$v_patch $L_PH_ZERO"
+        echo -e "${B}+--------------------------------------------------------+${NC}\033[K"
         echo -e "${W}Status:${NC} $r_msg\033[K"
-        echo -e "\033[J" # Limpiar resto de pantalla
+        echo -e "\033[J" 
     fi
 }
 
-# --- LÓGICA PRINCIPAL ---
+# --- LOGICA ---
 
 monitor_badblocks() {
     local pid=$1
@@ -219,7 +229,6 @@ monitor_badblocks() {
                 local current_sector_lba=$((pos_bytes / 512))
                 SECTOR_ACTUAL=$current_sector_lba
                 
-                # Guardado periódico
                 local current_time=$(date +%s)
                 if (( current_time - last_write_time >= BACKUP_INTERVAL )); then
                     echo "DEVICE=$DISCO" > $STATE_FILE
@@ -230,7 +239,6 @@ monitor_badblocks() {
                     last_write_time=$current_time
                 fi
 
-                # LLAMADA AL MOTOR GRÁFICO (Modo SCAN)
                 draw_screen "SCAN" "$current_sector_lba" "$total_sectors" "${spin:$i:1}" "Monitorizando..." 
             fi
         fi
@@ -242,20 +250,16 @@ reparar_sector() {
     local sector=$1
     local modo_rescate=0
     
-    # Save State
     echo "DEVICE=$DISCO" > $STATE_FILE
     echo "LAST_SECTOR=$sector" >> $STATE_FILE
     echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
     echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
     echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
 
-    # Función helper para redibujar rápido dentro de esta función
-    # Argumentos: (st_read, st_resc, st_patch, mensaje)
     update_card() {
         draw_screen "REPAIR" "$sector" "$TOTAL_SECTORS" "!" "Interviniendo..." "$sector" "$1" "$2" "$3" "$4"
     }
 
-    # --- FASE 1: LECTURA ---
     update_card 0 0 0 "Analizando sector..."
 
     start_t=$(date +%s.%N)
@@ -284,7 +288,6 @@ reparar_sector() {
     fi
 
     if [ $procesar -eq 1 ]; then
-        # --- FASE 2: PREPARAR RESCATE ---
         if [ $modo_rescate -eq 1 ]; then
             hex_dump=$(echo "$raw_output" | grep -E "^[0-9a-fA-F]{4}" | tr -d ' \r\n')
             echo "$hex_dump" | xxd -r -p > "$BIN_TEMP"
@@ -295,12 +298,10 @@ reparar_sector() {
             fi
         fi
 
-        # --- FASE 3: CAUTERIZAR (Ceros) ---
         update_card 2 $modo_rescate 0 "${Y}Escribiendo ceros (Remapeo)...${NC}"
         hdparm --write-sector "$sector" --yes-i-know-what-i-am-doing "$DISCO" > /dev/null 2>&1
         sleep 0.5
 
-        # --- FASE 4: RESTAURAR O FINALIZAR ---
         if [ $modo_rescate -eq 1 ]; then
             update_card 2 1 0 "Restaurando datos (DD)..."
             dd if="$BIN_TEMP" of="$DISCO" bs=512 count=1 seek="$sector" conv=fdatasync status=none
@@ -315,7 +316,6 @@ reparar_sector() {
                  update_card 2 3 1 "${Y}Fallo Restore. Ceros aplicados.${NC}"
             fi
         else
-            # Verificación post-cauterización
             hdparm --read-sector "$sector" "$DISCO" > /dev/null 2>&1
             if [ $? -eq 0 ]; then
                 ((TOTAL_CEROS++))
@@ -335,7 +335,6 @@ reparar_sector() {
 TOTAL_SECTORS=$(blockdev --getsz $DISCO)
 START_SECTOR=0
 
-# Recuperar Estado
 if [ -f "$STATE_FILE" ]; then
     source $STATE_FILE
     if [ "$DEVICE" == "$DISCO" ]; then
@@ -349,11 +348,9 @@ if [ -f "$STATE_FILE" ]; then
     fi
 fi
 
-# Cola Pendiente
 if [ -s "$PENDING_FILE" ]; then
     while IFS= read -r pending_sector; do
         reparar_sector "$pending_sector"
-        # Eliminar línea procesada para actualizar contador en tiempo real (opcional, pero visualmente correcto)
         sed -i "1d" "$PENDING_FILE"
     done < "$PENDING_FILE"
     rm -f "$PENDING_FILE"
@@ -375,11 +372,9 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
     monitor_badblocks $PID_BB $TOTAL_SECTORS
 
     if [ -s $TEMP_LIST ]; then
-        # Copiar temp list a pending memory para no machacarlo
         cat "$TEMP_LIST" > .current_chunk_list
         while IFS= read -r bad_sector; do
             reparar_sector "$bad_sector"
-            # Truco visual: eliminamos la línea de la lista temporal para que el contador de pendientes baje
             sed -i "/^$bad_sector$/d" "$TEMP_LIST"
         done < .current_chunk_list
         rm .current_chunk_list
