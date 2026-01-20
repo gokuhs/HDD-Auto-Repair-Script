@@ -1,86 +1,98 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ? DISK HEALER v1.0 - REPARACIÓN INTELIGENTE Y AUTOMATIZADA
-#  Combina badblocks + hdparm + dd para revivir discos duros
+#  ? DISK HEALER v2.0 - VISUAL UPGRADE
+#  Reparación automática con Feedback Visual en tiempo real
 # ==============================================================================
 
 # --- CONFIGURACIÓN ---
-CHUNK_PERCENT=2      # Porcentaje del disco a escanear en cada pasada
-TIEMPO_MAX=1.0       # Umbral de latencia para considerar un sector "Lento"
+CHUNK_PERCENT=2      # Porcentaje por bloque (mantener bajo para más actualizaciones visuales)
+TIEMPO_MAX=1.0       
 STATE_FILE=".disk_healer_state"
 LOG_FILE="disk_healer_report.log"
 TEMP_LIST="/tmp/badblocks_chunk.txt"
 BIN_TEMP="/tmp/sector_rescued.bin"
 # ---------------------
 
-# Colores
+# Colores y Cursores
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-# 1. VERIFICACIÓN DE PARÁMETROS
-if [ "$EUID" -ne 0 ]; then echo -e "${RED}? Ejecuta como root (sudo).${NC}"; exit 1; fi
+# Ocultar cursor para limpieza visual
+tput civis
 
-if [ -z "$1" ]; then
-    echo -e "${YELLOW}Uso: $0 <dispositivo>${NC}"
-    echo "Ejemplo: $0 /dev/sdd"
-    exit 1
-fi
+# Restaurar cursor al salir
+cleanup_exit() {
+    tput cnorm
+    rm -f $TEMP_LIST $BIN_TEMP
+    exit
+}
+trap cleanup_exit SIGINT SIGTERM EXIT
+
+# 1. VERIFICACIONES (Igual que antes)
+if [ "$EUID" -ne 0 ]; then echo -e "${RED}? Ejecuta como root.${NC}"; exit 1; fi
+if [ -z "$1" ]; then echo -e "${YELLOW}Uso: $0 <dispositivo>${NC}"; exit 1; fi
 DISCO=$1
 
-# 2. VERIFICACIÓN DE DEPENDENCIAS
 DEPENDENCIAS=("hdparm" "dd" "xxd" "bc" "badblocks")
-FALTAN=()
-
 for dep in "${DEPENDENCIAS[@]}"; do
     if ! command -v $dep &> /dev/null; then
-        FALTAN+=($dep)
+        echo -e "${RED}? Falta: $dep${NC}"; exit 1
     fi
 done
 
-if [ ${#FALTAN[@]} -ne 0 ]; then
-    echo -e "${RED}? Faltan herramientas necesarias: ${FALTAN[*]}${NC}"
-    echo "Instálalas con uno de estos comandos:"
-    echo -e "${BLUE}Debian/Ubuntu/Kali:${NC} sudo apt update && sudo apt install smartmontools gdisk e2fsprogs bc xxd"
-    echo -e "${BLUE}Arch Linux:${NC}        sudo pacman -S hdparm bc vi (para xxd) e2fsprogs"
-    echo -e "${BLUE}Fedora/RHEL:${NC}       sudo dnf install hdparm bc vim-common e2fsprogs"
-    exit 1
-fi
+# --- FUNCIONES VISUALES ---
 
-# 3. CONTROL DE INTERRUPCIONES (CTRL+C) Y ESTADÍSTICAS
+# Dibuja una barra de progreso: [####....] 45%
+draw_progress_bar() {
+    local width=40
+    local progress=$1 # 0-100
+    local num_filled=$(echo "scale=0; $width * $progress / 100" | bc)
+    local num_empty=$((width - num_filled))
+    
+    # Crear cadenas de # y .
+    local filled=$(printf "%0.s#" $(seq 1 $num_filled))
+    local empty=$(printf "%0.s." $(seq 1 $num_empty))
+
+    # Imprimir barra sobrescribiendo la línea (\r)
+    printf "\r${BLUE}[${filled}${empty}] ${progress}%%${NC}"
+}
+
+# Spinner animado mientras espera un proceso PID
+wait_with_spinner() {
+    local pid=$1
+    local info_text=$2
+    local spin='-\|/'
+    local i=0
+    
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) %4 ))
+        # Imprime: [Spinner] Texto de estado (Sectores actuales)
+        printf "\r${CYAN}[${spin:$i:1}]${NC} %s" "$info_text"
+        sleep 0.1
+    done
+    # Limpiar línea al terminar
+    printf "\r\033[K"
+}
+
+# --- ESTADÍSTICAS ---
 TOTAL_SALVADOS=0
 TOTAL_CEROS=0
 TOTAL_FALLIDOS=0
 SECTOR_ACTUAL=0
 
-cleanup() {
-    echo -e "\n\n${YELLOW}??  INTERRUPCIÓN DETECTADA (Ctrl+C)${NC}"
-    echo "Guardando estado en $STATE_FILE..."
-    # Guardamos dispositivo, sector actual y estadísticas
-    echo "DEVICE=$DISCO" > $STATE_FILE
-    echo "LAST_SECTOR=$SECTOR_ACTUAL" >> $STATE_FILE
-    echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
-    echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
-    echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
-    
-    echo -e "? Informe guardado en $LOG_FILE"
-    echo -e "${BLUE}??  Para reanudar, ejecuta exactamente el mismo comando.${NC}"
-    rm -f $TEMP_LIST $BIN_TEMP
-    exit 0
-}
-trap cleanup SIGINT
-
-# 4. LÓGICA DE REPARACIÓN (La v5.1 optimizada)
+# --- FUNCIÓN DE REPARACIÓN (Lógica v5.1) ---
 reparar_sector() {
     local sector=$1
     local modo_rescate=0
     
-    echo -n "[Sector $sector] " | tee -a $LOG_FILE
+    # Nueva línea para el log de reparación
+    echo -e "\n? Analizando sector $sector..." 
 
-    # --- DIAGNÓSTICO ---
     start_t=$(date +%s.%N)
     raw_output=$(hdparm --read-sector "$sector" "$DISCO" 2>&1)
     status_read=$?
@@ -89,24 +101,21 @@ reparar_sector() {
 
     procesar=0
     if [ $status_read -ne 0 ]; then
-        echo -n "? ERROR LECTURA. " | tee -a $LOG_FILE
-        procesar=1
-        modo_rescate=0
+        echo -e "${RED}   ? ILEGIBLE. Iniciando protocolo destructivo.${NC}" | tee -a $LOG_FILE
+        procesar=1; modo_rescate=0
     else
         es_lento=$(echo "$duracion > $TIEMPO_MAX" | bc -l)
         if [ "$es_lento" -eq 1 ]; then
-            echo -n "??  LENTO (${duracion}s). " | tee -a $LOG_FILE
-            procesar=1
-            modo_rescate=1
+            echo -e "${YELLOW}   ??  LENTO (${duracion}s). Intentando rescate.${NC}" | tee -a $LOG_FILE
+            procesar=1; modo_rescate=1
         else
-            echo "? OK (${duracion}s)." | tee -a $LOG_FILE
+            echo -e "${GREEN}   ? OK (${duracion}s). Falsa alarma.${NC}"
             procesar=0
         fi
     fi
 
     if [ $procesar -eq 0 ]; then return; fi
 
-    # --- PREPARACIÓN (Rescue) ---
     if [ $modo_rescate -eq 1 ]; then
         hex_dump=$(echo "$raw_output" | grep -E "^[0-9a-fA-F]{4}" | tr -d ' \r\n')
         echo "$hex_dump" | xxd -r -p > "$BIN_TEMP"
@@ -114,111 +123,104 @@ reparar_sector() {
         if [ "$size" -ne 512 ]; then modo_rescate=0; fi
     fi
 
-    # --- CAUTERIZACIÓN (Zero Fill) ---
+    # Cauterizar
     hdparm --write-sector "$sector" --yes-i-know-what-i-am-doing "$DISCO" > /dev/null 2>&1
-    sleep 0.5 # Pausa táctica
+    sleep 0.5
 
-    # --- RESTAURACIÓN ---
-    status_final="FALLIDO"
-    
+    # Restaurar
     if [ $modo_rescate -eq 1 ]; then
         dd if="$BIN_TEMP" of="$DISCO" bs=512 count=1 seek="$sector" conv=fdatasync status=none
         if [ $? -eq 0 ]; then
-            echo -e "${GREEN}? ¡DATO SALVADO!${NC}" | tee -a $LOG_FILE
+            echo -e "${GREEN}   ? DATO SALVADO Y RESTAURADO${NC}" | tee -a $LOG_FILE
             ((TOTAL_SALVADOS++))
-            status_final="SALVADO"
         else
-             # Fallback a ceros
              hdparm --write-sector "$sector" --yes-i-know-what-i-am-doing "$DISCO" > /dev/null 2>&1
-             if [ $? -eq 0 ]; then
-                echo -e "${YELLOW}? SECTOR DESBLOQUEADO (Ceros)${NC}" | tee -a $LOG_FILE
-                ((TOTAL_CEROS++))
-                status_final="CEROS"
-             else
-                echo -e "${RED}? FALLO TOTAL${NC}" | tee -a $LOG_FILE
-                ((TOTAL_FALLIDOS++))
-             fi
+             echo -e "${YELLOW}   ? SECTOR LIMPIADO (Ceros)${NC}" | tee -a $LOG_FILE
+             ((TOTAL_CEROS++))
         fi
     else
-        # Verificación simple tras borrar
         hdparm --read-sector "$sector" "$DISCO" > /dev/null 2>&1
         if [ $? -eq 0 ]; then
-            echo -e "${YELLOW}? SECTOR DESBLOQUEADO (Ceros)${NC}" | tee -a $LOG_FILE
+            echo -e "${YELLOW}   ? SECTOR LIMPIADO (Ceros)${NC}" | tee -a $LOG_FILE
             ((TOTAL_CEROS++))
-            status_final="CEROS"
         else
-            echo -e "${RED}? FALLO TOTAL${NC}" | tee -a $LOG_FILE
+            echo -e "${RED}   ? FALLO FÍSICO PERMANENTE${NC}" | tee -a $LOG_FILE
             ((TOTAL_FALLIDOS++))
         fi
     fi
+    echo "---------------------------------------------------"
 }
 
-
-# 5. INICIO Y REANUDACIÓN
+# --- INICIO ---
 TOTAL_SECTORS=$(blockdev --getsz $DISCO)
 START_SECTOR=0
 
+# Recuperar estado
 if [ -f "$STATE_FILE" ]; then
     source $STATE_FILE
     if [ "$DEVICE" == "$DISCO" ]; then
-        echo -e "${YELLOW}? Se detectó una sesión previa interrumpida en el sector $LAST_SECTOR.${NC}"
-        echo -n "¿Deseas reanudar? [S/n]: "
-        read respuesta
-        if [[ "$respuesta" =~ ^[Ss]$ ]] || [[ -z "$respuesta" ]]; then
-            START_SECTOR=$LAST_SECTOR
-            # Recuperar stats previos
-            TOTAL_SALVADOS=${STATS_SALVADOS:-0}
-            TOTAL_CEROS=${STATS_CEROS:-0}
-            TOTAL_FALLIDOS=${STATS_FALLIDOS:-0}
-        fi
+        echo -e "${YELLOW}? Reanudando desde el sector $LAST_SECTOR${NC}"
+        START_SECTOR=$LAST_SECTOR
+        TOTAL_SALVADOS=${STATS_SALVADOS:-0}
+        TOTAL_CEROS=${STATS_CEROS:-0}
+        TOTAL_FALLIDOS=${STATS_FALLIDOS:-0}
+        sleep 2
     else
-        echo -e "${RED}??  El archivo de estado pertenece a otro disco ($DEVICE). Se iniciará de cero.${NC}"
         rm $STATE_FILE
     fi
 fi
 
 CHUNK_SIZE=$(echo "$TOTAL_SECTORS * $CHUNK_PERCENT / 100" | bc)
-# Ajuste mínimo de chunk por si el disco es pequeño
 if [ "$CHUNK_SIZE" -lt 2048 ]; then CHUNK_SIZE=2048; fi 
 
+clear
 echo "==================================================="
-echo " ? DISK HEALER - INICIANDO"
-echo " ? Objetivo: $DISCO ($TOTAL_SECTORS sectores)"
-echo " ? Bloque de escaneo: $CHUNK_SIZE sectores (~$CHUNK_PERCENT%)"
+echo -e "${CYAN} ? DISK HEALER v2.0 - LIVE MONITOR${NC}"
+echo " ? Disco: $DISCO"
+echo " ? Total Sectores: $TOTAL_SECTORS"
 echo "==================================================="
 
-# 6. BUCLE PRINCIPAL (CHUNK LOOP)
 CURRENT=$START_SECTOR
 
 while [ $CURRENT -lt $TOTAL_SECTORS ]; do
     END=$((CURRENT + CHUNK_SIZE))
     if [ $END -gt $TOTAL_SECTORS ]; then END=$TOTAL_SECTORS; fi
     
+    # Calcular porcentaje
     PERCENT=$(echo "scale=2; $CURRENT * 100 / $TOTAL_SECTORS" | bc)
-    echo -e "${BLUE}? Escaneando rango: $CURRENT - $END ($PERCENT%)${NC}"
     
-    # Actualizar puntero global para el trap
+    # 1. Dibujar Barra de Progreso estática arriba
+    draw_progress_bar "$PERCENT"
+    
+    # 2. Ejecutar Badblocks en BACKGROUND (&)
+    #    y capturar su PID para mostrar el spinner
+    badblocks -b 512 -s $DISCO $END $CURRENT > $TEMP_LIST 2> /dev/null &
+    PID_BB=$!
+    
+    # 3. Mostrar Spinner con info de rango mientras badblocks trabaja
+    wait_with_spinner $PID_BB "Escaneando sectores: $CURRENT - $END"
+
+    # Actualizar para trap
     SECTOR_ACTUAL=$CURRENT
 
-    # Ejecutar Badblocks en el rango actual
-    # -b 512: Bloque físico real
-    # -o: Salida a archivo temporal
-    badblocks -b 512 -s $DISCO $END $CURRENT > $TEMP_LIST 2> /dev/null
-
-    # Si hay sectores malos, procesarlos
+    # 4. Procesar errores si los hay
     if [ -s $TEMP_LIST ]; then
+        # Limpiar línea visual
+        printf "\r\033[K"
         NUM_ERRORS=$(wc -l < $TEMP_LIST)
-        echo -e "${RED}??  Se encontraron $NUM_ERRORS sectores malos. Iniciando reparación...${NC}"
+        echo -e "${RED}??  Detectados $NUM_ERRORS sectores malos en este bloque.${NC}"
         
         while IFS= read -r bad_sector; do
             reparar_sector "$bad_sector"
         done < $TEMP_LIST
+        
+        # Pausa breve para leer lo que pasó antes de seguir
+        sleep 2
     fi
 
-    # Avanzar
     CURRENT=$END
     
-    # Guardar estado intermedio (checkpointing seguro)
+    # Guardar Estado
     echo "DEVICE=$DISCO" > $STATE_FILE
     echo "LAST_SECTOR=$CURRENT" >> $STATE_FILE
     echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
@@ -226,12 +228,9 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
     echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
 done
 
-# 7. FINALIZACIÓN
-echo "==================================================="
+draw_progress_bar "100"
+echo -e "\n\n==================================================="
 echo -e "${GREEN}? PROCESO COMPLETADO${NC}"
-echo "---------------------------------------------------"
-echo " ? Datos Salvados  : $TOTAL_SALVADOS"
-echo " ? Sectores Ceros  : $TOTAL_CEROS"
-echo " ? Irrecuperables  : $TOTAL_FALLIDOS"
+echo " ? Datos Salvados : $TOTAL_SALVADOS"
+echo " ? Sectores Ceros : $TOTAL_CEROS"
 echo "==================================================="
-rm -f $STATE_FILE $TEMP_LIST $BIN_TEMP
