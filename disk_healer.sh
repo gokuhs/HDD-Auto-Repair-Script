@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ? DISK HEALER v6.2 - ROBUST UI FIX
+#  💾 DISK HEALER v6.2 - ROBUST UI FIX
 #  Corrección: Error printf, variables vacías y limpieza visual (anti-ghosting)
 # ==============================================================================
 
