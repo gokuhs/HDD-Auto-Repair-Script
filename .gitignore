@@ -1,0 +1,5 @@
+# Ignorar logs y estados de ejecución
+*.log
+.disk_healer_state
+*.bin
+/tmp/*
