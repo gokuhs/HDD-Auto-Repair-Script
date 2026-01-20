@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ? DISK HEALER v4.1 - BUGFIX 
-#  Fixed variable expansion in localized strings
+#  ? DISK HEALER v4.2 - BULLETPROOF EDITION
+#  Fix: State update during repair phase to prevent skipping sectors on interrupt
 # ==============================================================================
 
 # --- CONFIG / CONFIGURACIÓN ---
@@ -25,24 +25,23 @@ CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
 NC='\033[0m'
 
-# --- LANGUAGE DETECTION / DETECCIÓN DE IDIOMA ---
+# --- LANGUAGE DETECTION ---
 detect_language() {
     if [[ "$LANG" == *"es_"* ]]; then
-        # SPANISH / ESPAÑOL
         TXT_ROOT="? Se requieren privilegios de Root (sudo)."
         TXT_USAGE="Uso: $0 <dispositivo>"
         TXT_MISSING="? Falta herramienta:"
         TXT_INTERRUPT="??  INTERRUPCIÓN DETECTADA."
-        TXT_RESUME_POS="? Posición capturada del Kernel:"
-        TXT_BACKUP_POS="? Usando último backup de seguridad:"
+        TXT_RESUME_POS="? Posición guardada:"
+        TXT_BACKUP_POS="? Usando último backup:"
         TXT_EXIT="Salida limpia."
         TXT_PROG_GLOBAL="Progreso Global:"
         TXT_SECTOR="Sector:"
         TXT_STATUS="Estado:"
-        TXT_SCANNING="Escaneando en busca de errores..."
+        TXT_SCANNING="Escaneando..."
+        TXT_REPAIRING="Reparando..."
         TXT_DETECTED="? SECTOR DEFECTUOSO DETECTADO:"
         TXT_UNREADABLE="   ? Ilegible. Iniciando destrucción."
-        # Usamos %s como marcador para inyectar la duración luego
         TXT_SLOW="   ??  Lento (%ss). Intentando rescate."  
         TXT_FALSE_ALARM="   ? Falsa alarma (Lectura OK)."
         TXT_RESTORED="   ? DATO RESTAURADO."
@@ -51,25 +50,25 @@ detect_language() {
         TXT_RESUME_SESSION="? REANUDANDO SESIÓN"
         TXT_LAST_SECTOR="   Último sector:"
         TXT_OLD_STATE="??  Archivo de estado antiguo borrado."
-        TXT_HEADER=" ??  DISK HEALER v4.1 - MONITOR"
+        TXT_HEADER=" ??  DISK HEALER v4.2 - MONITOR"
         TXT_TARGET=" ? Objetivo:"
         TXT_SIZE=" ? Total:"
         TXT_FINISHED="? OPERACIÓN FINALIZADA"
         TXT_SAVED=" ? Salvados :"
         TXT_ZEROS=" ? Ceros    :"
     else
-        # ENGLISH (DEFAULT)
         TXT_ROOT="? Root privileges required (sudo)."
         TXT_USAGE="Usage: $0 <device>"
         TXT_MISSING="? Missing tool:"
         TXT_INTERRUPT="??  INTERRUPTION DETECTED."
-        TXT_RESUME_POS="? Position captured from Kernel:"
-        TXT_BACKUP_POS="? Using last security backup:"
+        TXT_RESUME_POS="? Position saved:"
+        TXT_BACKUP_POS="? Using last backup:"
         TXT_EXIT="Clean exit."
         TXT_PROG_GLOBAL="Global Progress:"
         TXT_SECTOR="Sector:"
         TXT_STATUS="Status:"
-        TXT_SCANNING="Scanning for errors..."
+        TXT_SCANNING="Scanning..."
+        TXT_REPAIRING="Repairing..."
         TXT_DETECTED="? BAD SECTOR DETECTED:"
         TXT_UNREADABLE="   ? Unreadable. Starting destruction."
         TXT_SLOW="   ??  Slow (%ss). Attempting rescue."
@@ -80,7 +79,7 @@ detect_language() {
         TXT_RESUME_SESSION="? RESUMING SESSION"
         TXT_LAST_SECTOR="   Last sector:"
         TXT_OLD_STATE="??  Old state file removed."
-        TXT_HEADER=" ??  DISK HEALER v4.1 - MONITOR"
+        TXT_HEADER=" ??  DISK HEALER v4.2 - MONITOR"
         TXT_TARGET=" ? Target:"
         TXT_SIZE=" ? Total:"
         TXT_FINISHED="? OPERATION FINISHED"
@@ -92,34 +91,15 @@ detect_language
 
 tput civis
 
-# --- TRAP & CLEANUP ---
+# --- TRAP ---
 cleanup_exit() {
     tput cnorm
-    if [ -n "$PID_BB" ] && kill -0 "$PID_BB" 2>/dev/null; then
-        fd_path=$(ls -l /proc/$PID_BB/fd 2>/dev/null | grep "$DISCO" | awk '{print $9}')
-        fd_num=${fd_path:+$(basename $fd_path)}
-        [ -z "$fd_num" ] && fd_num=3
-        
-        if [ -f "/proc/$PID_BB/fdinfo/$fd_num" ]; then
-            pos_bytes=$(grep "pos:" /proc/$PID_BB/fdinfo/$fd_num | awk '{print $2}')
-            if [[ "$pos_bytes" =~ ^[0-9]+$ ]]; then
-                LAST_POS=$((pos_bytes / 512))
-                echo "DEVICE=$DISCO" > $STATE_FILE
-                echo "LAST_SECTOR=$LAST_POS" >> $STATE_FILE
-                echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
-                echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
-                echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
-                
-                echo -e "\n\n${YELLOW}${TXT_INTERRUPT}${NC}"
-                echo -e "${TXT_RESUME_POS} ${CYAN}$LAST_POS${NC}"
-            fi
-        fi
-    elif [ -f "$REALTIME_POS_FILE" ]; then
-        LAST_POS=$(cat $REALTIME_POS_FILE)
-        echo "DEVICE=$DISCO" > $STATE_FILE
-        echo "LAST_SECTOR=$LAST_POS" >> $STATE_FILE
-        echo -e "\n\n${YELLOW}${TXT_INTERRUPT}${NC}"
-        echo -e "${TXT_BACKUP_POS} ${CYAN}$LAST_POS${NC}"
+    # Prioridad: 1. Estado actual (si existe). 2. Archivo realtime. 3. Archivo backup
+    if [ -f "$STATE_FILE" ]; then
+         # Leemos el último estado guardado (que ahora se actualiza al reparar)
+         LAST_POS=$(grep "LAST_SECTOR" $STATE_FILE | cut -d= -f2)
+         echo -e "\n\n${YELLOW}${TXT_INTERRUPT}${NC}"
+         echo -e "${TXT_RESUME_POS} ${CYAN}$LAST_POS${NC}"
     fi
 
     jobs -p | xargs -r kill > /dev/null 2>&1
@@ -179,7 +159,12 @@ monitor_badblocks() {
                 local current_sector_lba=$((pos_bytes / 512))
                 local current_time=$(date +%s)
                 if (( current_time - last_write_time >= BACKUP_INTERVAL )); then
-                    echo "$current_sector_lba" > $REALTIME_POS_FILE
+                    # Guardamos estado también durante el escaneo
+                    echo "DEVICE=$DISCO" > $STATE_FILE
+                    echo "LAST_SECTOR=$current_sector_lba" >> $STATE_FILE
+                    echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
+                    echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
+                    echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
                     last_write_time=$current_time
                 fi
                 local percent=$(echo "scale=2; $current_sector_lba * 100 / $total_sectors" | bc)
@@ -194,10 +179,23 @@ reparar_sector() {
     local sector=$1
     local modo_rescate=0
     
+    # >>> FIX v4.2: ACTUALIZAR ESTADO AL ENTRAR EN REPARACIÓN <<<
+    # Esto asegura que si cortas aquí, reanudas AQUÍ, no al final del bloque.
+    echo "DEVICE=$DISCO" > $STATE_FILE
+    echo "LAST_SECTOR=$sector" >> $STATE_FILE
+    echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
+    echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
+    echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
+    # >>> FIN FIX <<<
+
     printf "\r\033[K\n\033[K\n\033[K" 
     printf "\033[2A" 
+    
+    # Actualizar Dashboard visualmente para indicar reparación
+    local percent=$(echo "scale=2; $sector * 100 / $TOTAL_SECTORS" | bc)
+    draw_dashboard "$sector" "$TOTAL_SECTORS" "$percent" "${RED}${TXT_REPAIRING}${NC}" "!"
 
-    echo -e "\n${RED}${TXT_DETECTED} $sector${NC}"
+    printf "\n\n${RED}${TXT_DETECTED} $sector${NC}"
 
     start_t=$(date +%s.%N)
     raw_output=$(hdparm --read-sector "$sector" "$DISCO" 2>&1)
@@ -212,7 +210,6 @@ reparar_sector() {
     else
         es_lento=$(echo "$duracion > $TIEMPO_MAX" | bc -l)
         if [ "$es_lento" -eq 1 ]; then
-            # CORREGIDO: Usamos printf para inyectar la variable en el placeholder %s
             printf "${TXT_SLOW}\n" "$duracion" | tee -a $LOG_FILE
             procesar=1; modo_rescate=1
         else
@@ -253,7 +250,7 @@ reparar_sector() {
         fi
     fi
     sleep 1
-    echo "---------------------------------------------------"
+    printf "\033[2A" # Volver a subir para mantener dashboard limpio
 }
 
 # --- MAIN ---
@@ -293,6 +290,7 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
     END=$((CURRENT + CHUNK_SIZE))
     if [ $END -gt $TOTAL_SECTORS ]; then END=$TOTAL_SECTORS; fi
     
+    # IMPORTANTE: Al reanudar, badblocks empezará exactamente donde lo dejamos
     badblocks -b 512 -s $DISCO $END $CURRENT > $TEMP_LIST 2> /dev/null &
     PID_BB=$!
     
@@ -303,10 +301,13 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
         while IFS= read -r bad_sector; do
             reparar_sector "$bad_sector"
         done < $TEMP_LIST
+        # Limpiar salida visual tras reparar bloque
+        printf "\n"
     fi
 
     CURRENT=$END
     
+    # Guardado de fin de bloque
     echo "DEVICE=$DISCO" > $STATE_FILE
     echo "LAST_SECTOR=$CURRENT" >> $STATE_FILE
     echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
