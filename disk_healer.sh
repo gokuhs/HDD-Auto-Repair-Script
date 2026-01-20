@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ? DISK HEALER v4.0 - MULTILANGUAGE EDITION
-#  Auto-repair tool with Real-Time Kernel Monitoring & Precision Resume
+#  ? DISK HEALER v4.1 - BUGFIX 
+#  Fixed variable expansion in localized strings
 # ==============================================================================
 
 # --- CONFIG / CONFIGURACIÓN ---
@@ -42,7 +42,8 @@ detect_language() {
         TXT_SCANNING="Escaneando en busca de errores..."
         TXT_DETECTED="? SECTOR DEFECTUOSO DETECTADO:"
         TXT_UNREADABLE="   ? Ilegible. Iniciando destrucción."
-        TXT_SLOW="   ??  Lento (${duracion}s). Intentando rescate."
+        # Usamos %s como marcador para inyectar la duración luego
+        TXT_SLOW="   ??  Lento (%ss). Intentando rescate."  
         TXT_FALSE_ALARM="   ? Falsa alarma (Lectura OK)."
         TXT_RESTORED="   ? DATO RESTAURADO."
         TXT_REPLACED="   ? SECTOR REEMPLAZADO (Ceros)."
@@ -50,7 +51,7 @@ detect_language() {
         TXT_RESUME_SESSION="? REANUDANDO SESIÓN"
         TXT_LAST_SECTOR="   Último sector:"
         TXT_OLD_STATE="??  Archivo de estado antiguo borrado."
-        TXT_HEADER=" ??  DISK HEALER v4.0 - MONITOR"
+        TXT_HEADER=" ??  DISK HEALER v4.1 - MONITOR"
         TXT_TARGET=" ? Objetivo:"
         TXT_SIZE=" ? Total:"
         TXT_FINISHED="? OPERACIÓN FINALIZADA"
@@ -71,7 +72,7 @@ detect_language() {
         TXT_SCANNING="Scanning for errors..."
         TXT_DETECTED="? BAD SECTOR DETECTED:"
         TXT_UNREADABLE="   ? Unreadable. Starting destruction."
-        TXT_SLOW="   ??  Slow (${duracion}s). Attempting rescue."
+        TXT_SLOW="   ??  Slow (%ss). Attempting rescue."
         TXT_FALSE_ALARM="   ? False alarm (Read OK)."
         TXT_RESTORED="   ? DATA RESTORED."
         TXT_REPLACED="   ? SECTOR REPLACED (Zeros)."
@@ -79,7 +80,7 @@ detect_language() {
         TXT_RESUME_SESSION="? RESUMING SESSION"
         TXT_LAST_SECTOR="   Last sector:"
         TXT_OLD_STATE="??  Old state file removed."
-        TXT_HEADER=" ??  DISK HEALER v4.0 - MONITOR"
+        TXT_HEADER=" ??  DISK HEALER v4.1 - MONITOR"
         TXT_TARGET=" ? Target:"
         TXT_SIZE=" ? Total:"
         TXT_FINISHED="? OPERATION FINISHED"
@@ -211,7 +212,8 @@ reparar_sector() {
     else
         es_lento=$(echo "$duracion > $TIEMPO_MAX" | bc -l)
         if [ "$es_lento" -eq 1 ]; then
-            echo -e "${TXT_SLOW}" | tee -a $LOG_FILE
+            # CORREGIDO: Usamos printf para inyectar la variable en el placeholder %s
+            printf "${TXT_SLOW}\n" "$duracion" | tee -a $LOG_FILE
             procesar=1; modo_rescate=1
         else
             echo -e "${TXT_FALSE_ALARM}"
