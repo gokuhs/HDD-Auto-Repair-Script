@@ -1,14 +1,15 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ? DISK HEALER v4.2 - BULLETPROOF EDITION
-#  Fix: State update during repair phase to prevent skipping sectors on interrupt
+#  ? DISK HEALER v5.0 - ZERO DATA LOSS
+#  Persistencia de errores pendientes en caso de interrupción durante el escaneo.
 # ==============================================================================
 
 # --- CONFIG / CONFIGURACIÓN ---
 CHUNK_PERCENT=2
 TIEMPO_MAX=1.0       
 STATE_FILE=".disk_healer_state"
+PENDING_FILE=".disk_healer_pending" # <--- NUEVO: Cola de errores guardada
 LOG_FILE="disk_healer_report.log"
 TEMP_LIST="/tmp/badblocks_chunk.txt"
 BIN_TEMP="/tmp/sector_rescued.bin"
@@ -33,7 +34,9 @@ detect_language() {
         TXT_MISSING="? Falta herramienta:"
         TXT_INTERRUPT="??  INTERRUPCIÓN DETECTADA."
         TXT_RESUME_POS="? Posición guardada:"
-        TXT_BACKUP_POS="? Usando último backup:"
+        TXT_PENDING_SAVE="? Guardando lista de errores pendientes..."
+        TXT_PENDING_FOUND="??  Encontrada lista de errores previos no procesados."
+        TXT_PROCESSING_PENDING="? Procesando cola pendiente antes de escanear..."
         TXT_EXIT="Salida limpia."
         TXT_PROG_GLOBAL="Progreso Global:"
         TXT_SECTOR="Sector:"
@@ -50,7 +53,7 @@ detect_language() {
         TXT_RESUME_SESSION="? REANUDANDO SESIÓN"
         TXT_LAST_SECTOR="   Último sector:"
         TXT_OLD_STATE="??  Archivo de estado antiguo borrado."
-        TXT_HEADER=" ??  DISK HEALER v4.2 - MONITOR"
+        TXT_HEADER=" ??  DISK HEALER v5.0 - ZERO LOSS"
         TXT_TARGET=" ? Objetivo:"
         TXT_SIZE=" ? Total:"
         TXT_FINISHED="? OPERACIÓN FINALIZADA"
@@ -62,7 +65,9 @@ detect_language() {
         TXT_MISSING="? Missing tool:"
         TXT_INTERRUPT="??  INTERRUPTION DETECTED."
         TXT_RESUME_POS="? Position saved:"
-        TXT_BACKUP_POS="? Using last backup:"
+        TXT_PENDING_SAVE="? Saving pending error list..."
+        TXT_PENDING_FOUND="??  Found unprocessed error list."
+        TXT_PROCESSING_PENDING="? Processing pending queue before scanning..."
         TXT_EXIT="Clean exit."
         TXT_PROG_GLOBAL="Global Progress:"
         TXT_SECTOR="Sector:"
@@ -79,7 +84,7 @@ detect_language() {
         TXT_RESUME_SESSION="? RESUMING SESSION"
         TXT_LAST_SECTOR="   Last sector:"
         TXT_OLD_STATE="??  Old state file removed."
-        TXT_HEADER=" ??  DISK HEALER v4.2 - MONITOR"
+        TXT_HEADER=" ??  DISK HEALER v5.0 - ZERO LOSS"
         TXT_TARGET=" ? Target:"
         TXT_SIZE=" ? Total:"
         TXT_FINISHED="? OPERATION FINISHED"
@@ -91,15 +96,24 @@ detect_language
 
 tput civis
 
-# --- TRAP ---
+# --- TRAP INTELIGENTE ---
 cleanup_exit() {
     tput cnorm
-    # Prioridad: 1. Estado actual (si existe). 2. Archivo realtime. 3. Archivo backup
+    
+    # 1. Guardar Posición Exacta
     if [ -f "$STATE_FILE" ]; then
-         # Leemos el último estado guardado (que ahora se actualiza al reparar)
          LAST_POS=$(grep "LAST_SECTOR" $STATE_FILE | cut -d= -f2)
          echo -e "\n\n${YELLOW}${TXT_INTERRUPT}${NC}"
          echo -e "${TXT_RESUME_POS} ${CYAN}$LAST_POS${NC}"
+    fi
+
+    # 2. SALVAR ERRORES NO PROCESADOS (NUEVO)
+    # Si badblocks había encontrado algo y cortamos antes de procesarlo
+    if [ -s "$TEMP_LIST" ]; then
+        echo -e "${TXT_PENDING_SAVE}"
+        # Concatenamos por si acaso ya había uno
+        cat "$TEMP_LIST" >> "$PENDING_FILE"
+        sort -u "$PENDING_FILE" -o "$PENDING_FILE" # Eliminar duplicados
     fi
 
     jobs -p | xargs -r kill > /dev/null 2>&1
@@ -159,7 +173,6 @@ monitor_badblocks() {
                 local current_sector_lba=$((pos_bytes / 512))
                 local current_time=$(date +%s)
                 if (( current_time - last_write_time >= BACKUP_INTERVAL )); then
-                    # Guardamos estado también durante el escaneo
                     echo "DEVICE=$DISCO" > $STATE_FILE
                     echo "LAST_SECTOR=$current_sector_lba" >> $STATE_FILE
                     echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
@@ -179,19 +192,16 @@ reparar_sector() {
     local sector=$1
     local modo_rescate=0
     
-    # >>> FIX v4.2: ACTUALIZAR ESTADO AL ENTRAR EN REPARACIÓN <<<
-    # Esto asegura que si cortas aquí, reanudas AQUÍ, no al final del bloque.
+    # Actualizamos estado también al reparar
     echo "DEVICE=$DISCO" > $STATE_FILE
     echo "LAST_SECTOR=$sector" >> $STATE_FILE
     echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
     echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
     echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
-    # >>> FIN FIX <<<
 
     printf "\r\033[K\n\033[K\n\033[K" 
     printf "\033[2A" 
     
-    # Actualizar Dashboard visualmente para indicar reparación
     local percent=$(echo "scale=2; $sector * 100 / $TOTAL_SECTORS" | bc)
     draw_dashboard "$sector" "$TOTAL_SECTORS" "$percent" "${RED}${TXT_REPAIRING}${NC}" "!"
 
@@ -250,13 +260,14 @@ reparar_sector() {
         fi
     fi
     sleep 1
-    printf "\033[2A" # Volver a subir para mantener dashboard limpio
+    printf "\033[2A"
 }
 
 # --- MAIN ---
 TOTAL_SECTORS=$(blockdev --getsz $DISCO)
 START_SECTOR=0
 
+# 1. Recuperar Estado General
 if [ -f "$STATE_FILE" ]; then
     source $STATE_FILE
     if [ "$DEVICE" == "$DISCO" ]; then
@@ -266,11 +277,28 @@ if [ -f "$STATE_FILE" ]; then
         TOTAL_SALVADOS=${STATS_SALVADOS:-0}
         TOTAL_CEROS=${STATS_CEROS:-0}
         TOTAL_FALLIDOS=${STATS_FALLIDOS:-0}
-        sleep 2
+        sleep 1
     else
         echo -e "${RED}${TXT_OLD_STATE}${NC}"
         rm $STATE_FILE
     fi
+fi
+
+# 2. PROCESAR COLA PENDIENTE (LO QUE SE QUEDÓ A MEDIAS)
+if [ -s "$PENDING_FILE" ]; then
+    echo -e "${YELLOW}${TXT_PENDING_FOUND}${NC}"
+    echo -e "${CYAN}${TXT_PROCESSING_PENDING}${NC}"
+    sleep 2
+    
+    # Procesar línea a línea
+    while IFS= read -r pending_sector; do
+        reparar_sector "$pending_sector"
+    done < "$PENDING_FILE"
+    
+    # Si terminamos, borramos la cola
+    rm "$PENDING_FILE"
+    echo -e "${GREEN}Cola pendiente procesada. Reanudando escaneo...${NC}"
+    sleep 1
 fi
 
 CHUNK_SIZE=$(echo "$TOTAL_SECTORS * $CHUNK_PERCENT / 100" | bc)
@@ -290,7 +318,6 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
     END=$((CURRENT + CHUNK_SIZE))
     if [ $END -gt $TOTAL_SECTORS ]; then END=$TOTAL_SECTORS; fi
     
-    # IMPORTANTE: Al reanudar, badblocks empezará exactamente donde lo dejamos
     badblocks -b 512 -s $DISCO $END $CURRENT > $TEMP_LIST 2> /dev/null &
     PID_BB=$!
     
@@ -301,13 +328,14 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
         while IFS= read -r bad_sector; do
             reparar_sector "$bad_sector"
         done < $TEMP_LIST
-        # Limpiar salida visual tras reparar bloque
+        # Limpiar lista procesada
+        > $TEMP_LIST
         printf "\n"
     fi
 
     CURRENT=$END
     
-    # Guardado de fin de bloque
+    # Guardado seguro al final del chunk
     echo "DEVICE=$DISCO" > $STATE_FILE
     echo "LAST_SECTOR=$CURRENT" >> $STATE_FILE
     echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
