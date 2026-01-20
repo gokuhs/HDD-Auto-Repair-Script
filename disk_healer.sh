@@ -1,17 +1,19 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ? DISK HEALER v3.0 - LIVE DASHBOARD
-#  Ahora con telemetría en tiempo real leyendo directamente del Kernel
+#  ? DISK HEALER v3.2 - IO OPTIMIZED
+#  Escritura en disco reducida al mínimo + Captura de señal en tiempo real
 # ==============================================================================
 
 # --- CONFIGURACIÓN ---
-CHUNK_PERCENT=2      # Mantener bajo para checkpoints frecuentes
+CHUNK_PERCENT=2
 TIEMPO_MAX=1.0       
 STATE_FILE=".disk_healer_state"
 LOG_FILE="disk_healer_report.log"
 TEMP_LIST="/tmp/badblocks_chunk.txt"
 BIN_TEMP="/tmp/sector_rescued.bin"
+REALTIME_POS_FILE="/tmp/disk_healer_pos.tmp"
+BACKUP_INTERVAL=10   # Segundos entre escrituras de seguridad
 # ---------------------
 
 # Colores y UI
@@ -25,10 +27,48 @@ NC='\033[0m'
 
 tput civis # Ocultar cursor
 
+# --- TRAP INTELIGENTE: LECTURA DIRECTA DEL KERNEL ---
 cleanup_exit() {
     tput cnorm
-    rm -f $TEMP_LIST $BIN_TEMP
-    echo -e "\n${YELLOW}Saliendo...${NC}"
+    
+    # Si tenemos un PID de badblocks activo, leemos su posición AHORA MISMO
+    # Esto evita tener que escribir en disco constantemente durante la ejecución.
+    if [ -n "$PID_BB" ] && kill -0 "$PID_BB" 2>/dev/null; then
+        
+        # Lógica de extracción directa de /proc (sin archivos intermedios)
+        fd_path=$(ls -l /proc/$PID_BB/fd 2>/dev/null | grep "$DISCO" | awk '{print $9}')
+        fd_num=${fd_path:+$(basename $fd_path)}
+        [ -z "$fd_num" ] && fd_num=3
+        
+        if [ -f "/proc/$PID_BB/fdinfo/$fd_num" ]; then
+            pos_bytes=$(grep "pos:" /proc/$PID_BB/fdinfo/$fd_num | awk '{print $2}')
+            if [[ "$pos_bytes" =~ ^[0-9]+$ ]]; then
+                LAST_POS=$((pos_bytes / 512))
+                
+                # Guardamos estado
+                echo "DEVICE=$DISCO" > $STATE_FILE
+                echo "LAST_SECTOR=$LAST_POS" >> $STATE_FILE
+                echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
+                echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
+                echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
+                
+                echo -e "\n\n${YELLOW}??  INTERRUPCIÓN (Ctrl+C).${NC}"
+                echo -e "? Posición capturada del Kernel: ${CYAN}$LAST_POS${NC}"
+            fi
+        fi
+    elif [ -f "$REALTIME_POS_FILE" ]; then
+        # Fallback: Si el proceso ya murió, usamos el último backup de 10s
+        LAST_POS=$(cat $REALTIME_POS_FILE)
+        echo "DEVICE=$DISCO" > $STATE_FILE
+        echo "LAST_SECTOR=$LAST_POS" >> $STATE_FILE
+        # ... (resto de stats)
+        echo -e "\n\n${YELLOW}??  INTERRUPCIÓN.${NC}"
+        echo -e "? Usando último backup de seguridad: ${CYAN}$LAST_POS${NC}"
+    fi
+
+    jobs -p | xargs -r kill > /dev/null 2>&1
+    rm -f $TEMP_LIST $BIN_TEMP $REALTIME_POS_FILE
+    echo -e "${YELLOW}Salida limpia.${NC}"
     exit
 }
 trap cleanup_exit SIGINT SIGTERM EXIT
@@ -43,8 +83,7 @@ for dep in "${DEPENDENCIAS[@]}"; do
     if ! command -v $dep &> /dev/null; then echo -e "${RED}? Falta: $dep${NC}"; exit 1; fi
 done
 
-# --- FUNCIONES VISUALES AVANZADAS ---
-
+# --- DASHBOARD ---
 draw_dashboard() {
     local sector_actual=$1
     local total=$2
@@ -52,60 +91,52 @@ draw_dashboard() {
     local status_msg=$4
     local spinner=$5
 
-    # Cálculo de barra
     local width=50
     local num_filled=$(echo "scale=0; $width * $percent / 100" | bc)
     local num_empty=$((width - num_filled))
     local filled=$(printf "%0.s?" $(seq 1 $num_filled))
     local empty=$(printf "%0.s?" $(seq 1 $num_empty))
 
-    # Limpiar las últimas 3 líneas para redibujar sin parpadeo excesivo
-    # (Usamos retornos de carro \r y códigos ANSI para subir líneas si fuera necesario, 
-    #  pero para simplificar redibujamos una línea compleja)
-    
     printf "\r${BLUE}Progreso Global:${NC} [${filled}${empty}] ${CYAN}${percent}%%${NC}"
     printf "\n\033[K${PURPLE}[${spinner}]${NC} Sector: ${YELLOW}%'d${NC} / %'d" "$sector_actual" "$total"
     printf "\n\033[K${NC}Estado: $status_msg"
-    # Subir 2 líneas para la próxima actualización
     printf "\033[2A" 
 }
 
-# Esta función espía al proceso badblocks
+# --- MONITOR OPTIMIZADO (Solo escribe cada 10s) ---
 monitor_badblocks() {
     local pid=$1
     local total_sectors=$2
     local spin='-\|/'
     local i=0
+    local last_write_time=0
 
-    # Buscar qué File Descriptor (FD) usa badblocks para el disco
-    # Normalmente es el 3 o 4. Buscamos el link que apunte a nuestro /dev/sdX
-    sleep 0.5 # Dar tiempo a que arranque y abra el archivo
-    
-    # Truco: buscamos en /proc/PID/fd donde apunte al disco
+    sleep 0.5 
     local fd_path=$(ls -l /proc/$pid/fd 2>/dev/null | grep "$DISCO" | awk '{print $9}')
-    
-    if [ -z "$fd_path" ]; then
-        # Si falla la detección automática, asumimos 3 (estándar en badblocks)
-        fd_num=3
-    else
-        fd_num=$(basename $fd_path)
-    fi
+    local fd_num=${fd_path:+$(basename $fd_path)}
+    [ -z "$fd_num" ] && fd_num=3
 
     while kill -0 $pid 2>/dev/null; do
         i=$(( (i+1) %4 ))
-        local spinner="${spin:$i:1}"
         
-        # LEER POSICIÓN REAL DEL KERNEL
-        # fdinfo contiene "pos: <bytes>"
         if [ -f "/proc/$pid/fdinfo/$fd_num" ]; then
             local pos_bytes=$(grep "pos:" /proc/$pid/fdinfo/$fd_num | awk '{print $2}')
-            # Convertir bytes a sectores (bytes / 512)
-            local current_sector_lba=$((pos_bytes / 512))
             
-            # Calcular porcentaje real
-            local percent=$(echo "scale=2; $current_sector_lba * 100 / $total_sectors" | bc)
-            
-            draw_dashboard "$current_sector_lba" "$total_sectors" "$percent" "Escaneando en busca de errores..." "$spinner"
+            if [[ "$pos_bytes" =~ ^[0-9]+$ ]]; then
+                local current_sector_lba=$((pos_bytes / 512))
+                
+                # --- OPTIMIZACIÓN AQUÍ ---
+                # Solo escribimos en disco si han pasado 10 segundos
+                local current_time=$(date +%s)
+                if (( current_time - last_write_time >= BACKUP_INTERVAL )); then
+                    echo "$current_sector_lba" > $REALTIME_POS_FILE
+                    last_write_time=$current_time
+                fi
+                # -------------------------
+
+                local percent=$(echo "scale=2; $current_sector_lba * 100 / $total_sectors" | bc)
+                draw_dashboard "$current_sector_lba" "$total_sectors" "$percent" "Escaneando..." "${spin:$i:1}"
+            fi
         fi
         sleep 0.2
     done
@@ -116,9 +147,8 @@ reparar_sector() {
     local sector=$1
     local modo_rescate=0
     
-    # Borrar líneas del dashboard para mostrar log de reparación limpio
     printf "\r\033[K\n\033[K\n\033[K" 
-    printf "\033[2A" # Volver a subir
+    printf "\033[2A" 
 
     echo -e "\n${RED}? DETECTADO SECTOR DEFECTUOSO: $sector${NC}"
 
@@ -150,7 +180,6 @@ reparar_sector() {
             [ $(stat -c%s "$BIN_TEMP") -ne 512 ] && modo_rescate=0
         fi
 
-        # Cauterizar
         hdparm --write-sector "$sector" --yes-i-know-what-i-am-doing "$DISCO" > /dev/null 2>&1
         sleep 0.5
 
@@ -175,9 +204,7 @@ reparar_sector() {
             fi
         fi
     fi
-    # Pausa breve para leer
     sleep 1
-    # Limpieza visual para volver al dashboard
     echo "---------------------------------------------------"
 }
 
@@ -186,15 +213,18 @@ reparar_sector() {
 TOTAL_SECTORS=$(blockdev --getsz $DISCO)
 START_SECTOR=0
 
-# Estado
 if [ -f "$STATE_FILE" ]; then
     source $STATE_FILE
     if [ "$DEVICE" == "$DISCO" ]; then
+        echo -e "${YELLOW}? REANUDANDO SESIÓN${NC}"
+        echo -e "   Último sector: ${CYAN}$LAST_SECTOR${NC}"
         START_SECTOR=$LAST_SECTOR
         TOTAL_SALVADOS=${STATS_SALVADOS:-0}
         TOTAL_CEROS=${STATS_CEROS:-0}
         TOTAL_FALLIDOS=${STATS_FALLIDOS:-0}
+        sleep 2
     else
+        echo -e "${RED}??  Archivo de estado antiguo borrado.${NC}"
         rm $STATE_FILE
     fi
 fi
@@ -204,11 +234,11 @@ if [ "$CHUNK_SIZE" -lt 2048 ]; then CHUNK_SIZE=2048; fi
 
 clear
 echo "==================================================="
-echo -e "${CYAN} ??  DISK HEALER v3.0 - MONITOR KERNEL${NC}"
+echo -e "${CYAN} ??  DISK HEALER v3.2 - IO OPTIMIZED${NC}"
 echo " ? Objetivo: $DISCO"
-echo " ? Total: $(echo "$TOTAL_SECTORS / 2 / 1024" | bc) MB ($TOTAL_SECTORS sectores)"
+echo " ? Total: $(echo "$TOTAL_SECTORS / 2 / 1024" | bc) MB"
 echo "==================================================="
-echo "" # Espacio para el dashboard
+echo "" 
 
 CURRENT=$START_SECTOR
 
@@ -216,20 +246,13 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
     END=$((CURRENT + CHUNK_SIZE))
     if [ $END -gt $TOTAL_SECTORS ]; then END=$TOTAL_SECTORS; fi
     
-    # Ejecutar badblocks
     badblocks -b 512 -s $DISCO $END $CURRENT > $TEMP_LIST 2> /dev/null &
-    PID_BB=$!
+    PID_BB=$!  # HACEMOS GLOBAL EL PID PARA EL TRAP
     
-    # >>> AQUÍ ESTÁ LA MAGIA <<<
-    # Pasamos el PID a nuestra función de monitoreo que lee /proc
     monitor_badblocks $PID_BB $TOTAL_SECTORS
 
-    # Al terminar el bloque, verificamos errores
-    SECTOR_ACTUAL=$CURRENT
     if [ -s $TEMP_LIST ]; then
-        # Limpiar zona del dashboard
         printf "\n\n"
-        
         while IFS= read -r bad_sector; do
             reparar_sector "$bad_sector"
         done < $TEMP_LIST
@@ -237,7 +260,6 @@ while [ $CURRENT -lt $TOTAL_SECTORS ]; do
 
     CURRENT=$END
     
-    # Save state
     echo "DEVICE=$DISCO" > $STATE_FILE
     echo "LAST_SECTOR=$CURRENT" >> $STATE_FILE
     echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
@@ -247,7 +269,6 @@ done
 
 printf "\n\n"
 echo "==================================================="
-echo -e "${GREEN}? OPERACIÓN FINALIZADA${NC}"
-echo " ? Salvados : $TOTAL_SALVADOS"
-echo " ? Ceros    : $TOTAL_CEROS"
+echo -e "${GREEN}? FINALIZADO${NC}"
 echo "==================================================="
+rm -f $STATE_FILE
