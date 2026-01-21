@@ -7,7 +7,7 @@
 
 ---
 
-## ?? DISCLAIMER / DESCARGO DE RESPONSABILIDAD
+## DISCLAIMER / DESCARGO DE RESPONSABILIDAD
 
 > **ENGLISH:**
 > THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. USE IT AT YOUR OWN RISK.
@@ -19,7 +19,7 @@
 
 ---
 
-## ? Features / Características
+## Features / Características
 
 | Feature | Description (EN) | Descripción (ES) |
 | :--- | :--- | :--- |
@@ -31,7 +31,7 @@
 
 ---
 
-## ? Usage / Uso
+## Usage / Uso
 
 ### 1. Requirements / Requisitos
 This script requires standard Linux tools. It will auto-detect missing ones.
@@ -51,35 +51,33 @@ Clone el repositorio y dé permisos de ejecución:
 git clone ssh://git@gitlab.gokuhs.eu:443/gokuhs-software/hdd-auto-repair-script.git
 cd hdd-auto-repair-script
 chmod +x disk_healer.sh
+```
 
 ### 3. Execution / Ejecución
 
 Run as root indicating the target drive: Ejecute como root indicando el disco objetivo:
 ```Bash
-
   sudo ./disk_healer.sh /dev/sdX
+```
 
   (Replace /dev/sdX with your actual drive, e.g., /dev/sdb).
 
-?? How it works / Cómo funciona
+## How it works / Cómo funciona
 
-    Scanning: It runs badblocks in 2% chunks to find damaged areas.
+  **Scanning**: It runs badblocks in 2% chunks to find damaged areas.
 
-    Detection: If bad sectors are found, it switches to "Surgical Mode".
+  **Detection**: If bad sectors are found, it switches to "Surgical Mode".
 
-    Analysis: It checks if the sector is unreadable or just slow.
+  **Analysis**: It checks if the sector is unreadable or just slow.
 
-    Rescue Attempt:
+  **Rescue Attempt**:
 
-        It tries to read the raw data using hdparm.
+1. It tries to read the raw data using hdparm
+1. It converts hex dump to binary.
+1. It forces a sector re-map by writing zeros (cauterization).
+1. It restores the original data using dd.
 
-        It converts hex dump to binary.
-
-        It forces a sector re-map by writing zeros (cauterization).
-
-        It restores the original data using dd.
-
-    Fallback: If data cannot be saved, it leaves the sector zeroed out to prevent OS freezes.
+Fallback: If data cannot be saved, it leaves the sector zeroed out to prevent OS freezes.
 
 Author: Gokuhs License: MIT
 
