@@ -1,90 +1,90 @@
 #!/bin/bash
 
 # ==============================================================================
-#  ?? DISK HEALER v6.2 - ROBUST UI FIX
-#  Corrección: Error printf, variables vacías y limpieza visual (anti-ghosting)
+#  DISK HEALER v7.0 - SAFE REPAIR EDITION
+#  Reescritura centrada en evitar pérdida de datos:
+#   - Lectura cruzada (dd + hdparm) con decisión por status y desempate por voto
+#   - Restauración directa de la copia en sectores lentos (sin ceros intermedios)
+#   - Ceros SOLO en sectores ilegibles (forzar remapeo del firmware)
+#   - Verificación post-escritura (relectura + comparación)
+#   - Copias persistentes fuera de /tmp; se conservan si hubo discrepancia
+#   - Arranque blindado: montaje, utilidades, SMART, tamaño de sector real
+#   - Estado atómico y validado al reanudar (sin 'source')
 # ==============================================================================
+
+set -uo pipefail
+# NOTA: -e queda fuera a propósito. badblocks/hdparm/dd devuelven códigos !=0
+# esperados (encontrar bloque malo, leer sector dañado) que NO son errores fatales.
 
 # --- CONFIG ---
 CHUNK_PERCENT=2
-TIEMPO_MAX=1.0       
+TIEMPO_MAX=1.0                       # umbral (s) para considerar un sector "lento"
+BACKUP_INTERVAL=10                   # cada cuántos seg se persiste el estado en escaneo
+
 STATE_FILE=".disk_healer_state"
 PENDING_FILE=".disk_healer_pending"
 LOG_FILE="disk_healer_report.log"
+
+# Directorio persistente para copias de sectores rescatados (NO /tmp / NO tmpfs).
+RESCUE_DIR="./disk_healer_rescued"
+
+# Temporales de trabajo (sí pueden ir en /tmp; son volátiles por diseño)
 TEMP_LIST="/tmp/badblocks_chunk.txt"
-BIN_TEMP="/tmp/sector_rescued.bin"
-REALTIME_POS_FILE="/tmp/disk_healer_pos.tmp"
-BACKUP_INTERVAL=10
+BIN_DD="/tmp/sector_dd.bin"
+BIN_HDP="/tmp/sector_hdp.bin"
+BIN_VOTE="/tmp/sector_vote.bin"
+BIN_VERIFY="/tmp/sector_verify.bin"
 # --------------
 
 # Colores
-R='\033[0;31m'   # Rojo
-G='\033[0;32m'   # Verde
-Y='\033[1;33m'   # Amarillo
-B='\033[0;34m'   # Azul
-C='\033[0;36m'   # Cyan
-P='\033[0;35m'   # Purpura
-W='\033[1;37m'   # Blanco
-GR='\033[0;90m'  # Gris
-NC='\033[0m'     # Reset
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'
+C='\033[0;36m'; P='\033[0;35m'; W='\033[1;37m'; GR='\033[0;90m'; NC='\033[0m'
 
-# Variables Globales (Inicialización explícita)
+# Variables globales (inicialización explícita)
 SESSION_START_TIME=$(date +%s)
 SESSION_START_SECTOR=0
 TOTAL_SALVADOS=0
 TOTAL_CEROS=0
 TOTAL_FALLIDOS=0
+TOTAL_DUDOSOS=0
 SECTOR_ACTUAL=0
+SECTOR_SIZE=512
+TOTAL_SECTORS=0
 
 # --- IDIOMA ---
 detect_language() {
-    if [[ "$LANG" == *"es_"* ]]; then
-        L_STATS="ESTADISTICAS"
-        L_SAVED="Salvados"
-        L_ZEROS="Ceros"
-        L_FAIL="Fallidos"
-        L_PEND="Pendientes"
-        L_SPEED="Velocidad"
-        L_ETA="T. Restante"
-        L_FINISH="Fin Estimado"
-        L_SCAN="ESCANEANDO"
-        L_REPAIR="REPARANDO"
-        L_PLUS_REPAIR="(+ Reparacion)"
-        L_PH_READ="Lectura"
-        L_PH_RESC="Rescate"
-        L_PH_ZERO="Ceros"
+    if [[ "${LANG:-}" == *"es_"* ]]; then
+        L_SAVED="Salvados"; L_ZEROS="Ceros"; L_FAIL="Fallidos"; L_PEND="Pendientes"
+        L_DUB="Dudosos"; L_SPEED="Velocidad"; L_ETA="T. Restante"; L_FINISH="Fin Estimado"
+        L_SCAN="ESCANEANDO"; L_REPAIR="REPARANDO"; L_PLUS_REPAIR="(+ Reparacion)"
+        L_PH_READ="Lectura"; L_PH_RESC="Rescate"; L_PH_ZERO="Ceros"
     else
-        L_STATS="STATISTICS"
-        L_SAVED="Saved"
-        L_ZEROS="Zeros"
-        L_FAIL="Failed"
-        L_PEND="Pending"
-        L_SPEED="Speed"
-        L_ETA="ETA"
-        L_FINISH="Est. Finish"
-        L_SCAN="SCANNING"
-        L_REPAIR="REPAIRING"
-        L_PLUS_REPAIR="(+ Repair)"
-        L_PH_READ="Read"
-        L_PH_RESC="Rescue"
-        L_PH_ZERO="Zeros"
+        L_SAVED="Saved"; L_ZEROS="Zeros"; L_FAIL="Failed"; L_PEND="Pending"
+        L_DUB="Dubious"; L_SPEED="Speed"; L_ETA="ETA"; L_FINISH="Est. Finish"
+        L_SCAN="SCANNING"; L_REPAIR="REPAIRING"; L_PLUS_REPAIR="(+ Repair)"
+        L_PH_READ="Read"; L_PH_RESC="Rescue"; L_PH_ZERO="Zeros"
     fi
 }
 detect_language
-tput civis # Ocultar cursor
 
-# --- UTILS ---
+# ============================== LOGGING =======================================
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# ========================= UTILIDADES DE FORMATO ==============================
 format_seconds() {
-    local T=$1
-    local H=$((T/3600))
-    local M=$(( (T%3600)/60 ))
-    local S=$((T%60))
-    printf "%02d:%02d:%02d" $H $M $S
+    local T=${1:-0}
+    printf "%02d:%02d:%02d" $((T/3600)) $(((T%3600)/60)) $((T%60))
+}
+
+fmt_int() {
+    local n=${1:-0}
+    echo "$n" | sed -r ':a;s/([0-9])([0-9]{3})($|[^0-9])/\1.\2\3/;ta'
 }
 
 get_pending_count() {
-    local c1=0
-    local c2=0
+    local c1=0 c2=0
     if [ -f "$TEMP_LIST" ]; then
         c1=$(grep -cve '^\s*$' "$TEMP_LIST" 2>/dev/null)
     fi
@@ -94,301 +94,473 @@ get_pending_count() {
     echo $(( ${c1:-0} + ${c2:-0} ))
 }
 
+# ========================== ESTADO ATÓMICO ====================================
+write_state() {
+    local last_sector=$1
+    local tmp="${STATE_FILE}.tmp.$$"
+    {
+        echo "DEVICE=$DISCO"
+        echo "SECTOR_SIZE=$SECTOR_SIZE"
+        echo "LAST_SECTOR=$last_sector"
+        echo "STATS_SALVADOS=$TOTAL_SALVADOS"
+        echo "STATS_CEROS=$TOTAL_CEROS"
+        echo "STATS_FALLIDOS=$TOTAL_FALLIDOS"
+        echo "STATS_DUDOSOS=$TOTAL_DUDOSOS"
+    } > "$tmp"
+    sync "$tmp" 2>/dev/null
+    mv -f "$tmp" "$STATE_FILE"
+}
+
+read_state_value() {
+    local key=$1
+    grep -m1 "^${key}=" "$STATE_FILE" 2>/dev/null | cut -d'=' -f2-
+}
+
+is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
+# ========================= LIMPIEZA / SALIDA ==================================
 cleanup_exit() {
-    tput cnorm
+    tput cnorm 2>/dev/null
     if [ -s "$TEMP_LIST" ]; then
-        cat "$TEMP_LIST" >> "$PENDING_FILE"
-        sort -u "$PENDING_FILE" -o "$PENDING_FILE"
+        cat "$TEMP_LIST" >> "$PENDING_FILE" 2>/dev/null
+        sort -un "$PENDING_FILE" -o "$PENDING_FILE" 2>/dev/null
     fi
     jobs -p | xargs -r kill > /dev/null 2>&1
-    rm -f $TEMP_LIST $BIN_TEMP $REALTIME_POS_FILE
+    rm -f "$BIN_DD" "$BIN_HDP" "$BIN_VOTE" "$BIN_VERIFY" "$TEMP_LIST" 2>/dev/null
     echo -e "\n${NC}"
-    exit
 }
 trap cleanup_exit SIGINT SIGTERM EXIT
 
-# CHECKS
-if [ "$EUID" -ne 0 ]; then echo "Root required"; exit 1; fi
-DISCO=$1
-if [ -z "$DISCO" ]; then echo "Uso: $0 <device>"; exit 1; fi
+abort() {
+    tput cnorm 2>/dev/null
+    echo -e "\n${R}ERROR:${NC} $*" >&2
+    exit 1
+}
 
-# --- MOTOR GRÁFICO ---
+# ===================== COMPROBACIONES DE ARRANQUE =============================
+check_root() {
+    [ "$EUID" -eq 0 ] || abort "Se requieren privilegios de root."
+}
 
+check_utils() {
+    declare -A pkg=(
+        [hdparm]=hdparm
+        [badblocks]=e2fsprogs
+        [dd]=coreutils
+        [blockdev]=util-linux
+        [lsblk]=util-linux
+        [findmnt]=util-linux
+        [bc]=bc
+        [xxd]=xxd
+        [smartctl]=smartmontools
+        [cmp]=diffutils
+    )
+    local missing=()
+    for util in "${!pkg[@]}"; do
+        command -v "$util" >/dev/null 2>&1 || missing+=("$util (apt install ${pkg[$util]})")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${R}Faltan utilidades necesarias:${NC}" >&2
+        printf '  - %s\n' "${missing[@]}" >&2
+        abort "Instala los paquetes indicados y reintenta."
+    fi
+}
+
+check_device() {
+    DISCO=${1:-}
+    [ -n "$DISCO" ] || abort "Uso: $0 <device>  (ej. /dev/sdb)"
+    [ -b "$DISCO" ] || abort "$DISCO no es un dispositivo de bloque válido."
+}
+
+check_not_mounted() {
+    local mounted
+    mounted=$(lsblk -nro NAME,MOUNTPOINT "$DISCO" 2>/dev/null | awk '$2!="" {print $1" -> "$2}')
+    if [ -n "$mounted" ]; then
+        echo -e "${R}El dispositivo tiene puntos de montaje activos:${NC}" >&2
+        echo "$mounted" >&2
+        abort "Desmonta todo antes de continuar (umount). Operación abortada por seguridad."
+    fi
+}
+
+detect_sector_size() {
+    SECTOR_SIZE=$(blockdev --getss "$DISCO" 2>/dev/null)
+    local phys
+    phys=$(blockdev --getpbsz "$DISCO" 2>/dev/null)
+    is_uint "$SECTOR_SIZE" || abort "No se pudo determinar el tamaño de sector lógico."
+    TOTAL_SECTORS=$(blockdev --getsz "$DISCO" 2>/dev/null)
+    is_uint "$TOTAL_SECTORS" || abort "No se pudo determinar el total de sectores."
+    if [ "$SECTOR_SIZE" -ne 512 ]; then
+        TOTAL_SECTORS=$(( TOTAL_SECTORS * 512 / SECTOR_SIZE ))
+    fi
+    echo -e "${C}Tamaño de sector:${NC} lógico=${SECTOR_SIZE}  físico=${phys:-?}  | total=${TOTAL_SECTORS} sectores"
+    if [ "$SECTOR_SIZE" -ne 512 ]; then
+        echo -e "${Y}AVISO:${NC} disco no-512. Validando coherencia de unidades antes de cualquier escritura..."
+    fi
+}
+
+read_sector_dd() {
+    local sector=$1 out=$2
+    dd if="$DISCO" of="$out" bs="$SECTOR_SIZE" skip="$sector" count=1 \
+       iflag=direct status=none 2>/dev/null
+}
+
+read_sector_hdparm() {
+    local sector=$1 out=$2
+    local raw st
+    raw=$(hdparm --read-sector "$sector" "$DISCO" 2>&1)
+    st=$?
+    if [ $st -ne 0 ]; then
+        : > "$out"
+        return $st
+    fi
+    echo "$raw" | grep -Eo '([0-9a-fA-F]{4} ){1,}' | tr -d ' \r\n' | xxd -r -p > "$out"
+    return 0
+}
+
+validate_unit_coherence() {
+    echo -e "${C}Validando coherencia de unidades hdparm/dd...${NC}"
+    local test_sector=$(( TOTAL_SECTORS / 2 ))
+    local ok=0 tries=0
+    while [ $tries -lt 5 ]; do
+        if read_sector_dd "$test_sector" "$BIN_DD" \
+           && read_sector_hdparm "$test_sector" "$BIN_HDP" \
+           && [ -s "$BIN_DD" ] && [ -s "$BIN_HDP" ]; then
+            if cmp -s "$BIN_DD" "$BIN_HDP"; then
+                ok=1; break
+            fi
+        fi
+        test_sector=$(( test_sector + 1000 ))
+        [ "$test_sector" -ge "$TOTAL_SECTORS" ] && break
+        tries=$((tries+1))
+    done
+    if [ $ok -ne 1 ]; then
+        abort "hdparm y dd NO coinciden en la unidad de sector. Abortado para no corromper datos. Revisa manualmente."
+    fi
+    echo -e "${G}OK:${NC} hdparm y dd interpretan el sector de forma idéntica."
+    rm -f "$BIN_DD" "$BIN_HDP"
+}
+
+# ================================ SMART =======================================
+smart_attr() {
+    local name=$1
+    smartctl -A "$DISCO" 2>/dev/null | awk -v n="$name" '$2==n {print $NF; exit}'
+}
+
+show_smart() {
+    local title=$1
+    echo -e "\n${B}===== SMART ($title) =====${NC}"
+    local realloc pending offline
+    realloc=$(smart_attr "Reallocated_Sector_Ct")
+    pending=$(smart_attr "Current_Pending_Sector")
+    offline=$(smart_attr "Offline_Uncorrectable")
+    echo -e "  Reallocated_Sector_Ct : ${realloc:-N/A}"
+    echo -e "  Current_Pending_Sector: ${pending:-N/A}"
+    echo -e "  Offline_Uncorrectable : ${offline:-N/A}"
+    eval "SMART_${title}_REALLOC=\${realloc:-0}"
+    eval "SMART_${title}_PENDING=\${pending:-0}"
+    eval "SMART_${title}_OFFLINE=\${offline:-0}"
+}
+
+smart_compare() {
+    echo -e "\n${B}===== Comparativa SMART (inicio -> fin) =====${NC}"
+    local ri=${SMART_INICIO_REALLOC:-0} rf=${SMART_FIN_REALLOC:-0}
+    local pi=${SMART_INICIO_PENDING:-0} pf=${SMART_FIN_PENDING:-0}
+    is_uint "$ri" || ri=0; is_uint "$rf" || rf=0
+    is_uint "$pi" || pi=0; is_uint "$pf" || pf=0
+    echo -e "  Pendientes  : $pi -> $pf"
+    echo -e "  Reasignados : $ri -> $rf"
+    if [ "$pf" -lt "$pi" ]; then
+        echo -e "  ${G}El firmware procesó $((pi - pf)) sector(es) pendiente(s).${NC}"
+    fi
+    if [ "$rf" -gt "$ri" ]; then
+        echo -e "  ${Y}$((rf - ri)) sector(es) fueron remapeados a la zona de reserva.${NC}"
+    fi
+}
+
+# ============================ MOTOR GRÁFICO ===================================
 draw_screen() {
-    local mode=$1        
-    local sector=$2
-    local total=$3
-    local spinner=$4
-    local status_msg=$5
-    
-    local r_sector=$6
-    local st_read=$7
-    local st_resc=$8
-    local st_patch=$9
-    local r_msg=${10}
+    local mode=$1 sector=$2 total=$3 spinner=$4 status_msg=$5
+    local r_sector=${6:-0} st_read=${7:-0} st_resc=${8:-0} st_patch=${9:-0} r_msg=${10:-}
 
-    # Cálculos seguros (con defaults a 0)
-    local percent=$(echo "scale=2; ${sector:-0} * 100 / ${total:-1}" | bc)
-    local pending=$(get_pending_count)
-    
-    # Cálculo ETA
-    local current_time=$(date +%s)
-    local elapsed=$((current_time - SESSION_START_TIME))
-    local sectors_done=$((sector - SESSION_START_SECTOR))
-    local speed=0
-    local eta_str="--:--:--"
-    local finish_str="--:--"
-    
+    local percent
+    percent=$(echo "scale=2; ${sector:-0} * 100 / ${total:-1}" | bc 2>/dev/null)
+    [ -z "$percent" ] && percent="0.00"
+    local pending; pending=$(get_pending_count)
+
+    local current_time elapsed sectors_done speed=0 eta_str="--:--:--" finish_str="--:--"
+    current_time=$(date +%s)
+    elapsed=$((current_time - SESSION_START_TIME))
+    sectors_done=$((sector - SESSION_START_SECTOR))
     if [ $elapsed -gt 5 ] && [ $sectors_done -gt 0 ]; then
         speed=$((sectors_done / elapsed))
         if [ $speed -gt 0 ]; then
             local remaining=$((total - sector))
             local eta_seconds=$((remaining / speed))
             eta_str=$(format_seconds $eta_seconds)
-            finish_str=$(date -d "+$eta_seconds seconds" +"%H:%M")
+            finish_str=$(date -d "+$eta_seconds seconds" +"%H:%M" 2>/dev/null || echo "--:--")
         fi
-        if [ "$pending" -gt 0 ]; then eta_str="$eta_str $L_PLUS_REPAIR"; fi
+        [ "$pending" -gt 0 ] && eta_str="$eta_str $L_PLUS_REPAIR"
     fi
 
-    # --- PINTADO ---
-    printf "\033[H" # Mover a Home
-
-    # Header Box (Con \033[K al final para limpiar residuos)
+    printf "\033[H"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} %-25s ${GR}|${NC} %-41s ${B}|${NC}\033[K\n" "${W}DISK HEALER v6.2${NC}" "${C}$DISCO${NC}"
+    printf "${B}|${NC} %-25s ${GR}|${NC} %-41s ${B}|${NC}\033[K\n" "${W}DISK HEALER v7.0${NC}" "${C}$DISCO${NC}"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    
-    # Fila Stats (Aquí fallaba antes: añadimos :-0 para evitar vacíos)
-    printf "${B}|${NC} ${G}%-10s${NC} : %-4d ${GR}|${NC} ${Y}%-10s${NC} : %-4d ${GR}|${NC} ${R}%-10s${NC} : %-4d ${GR}|${NC} ${P}%-10s${NC} : %-4d ${B}|${NC}\033[K\n" \
+    printf "${B}|${NC} ${G}%-9s${NC}:%-4d ${GR}|${NC} ${Y}%-6s${NC}:%-4d ${GR}|${NC} ${R}%-8s${NC}:%-4d ${GR}|${NC} ${C}%-7s${NC}:%-4d ${GR}|${NC} ${P}%-9s${NC}:%-4d ${B}|${NC}\033[K\n" \
            "$L_SAVED" "${TOTAL_SALVADOS:-0}" \
            "$L_ZEROS" "${TOTAL_CEROS:-0}" \
            "$L_FAIL" "${TOTAL_FALLIDOS:-0}" \
+           "$L_DUB" "${TOTAL_DUDOSOS:-0}" \
            "$L_PEND" "${pending:-0}"
-    
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} %-10s : %-7s ${GR}|${NC} %-10s : %-19s ${GR}|${NC} %-10s : %-5s ${B}|${NC}\033[K\n" \
+    printf "${B}|${NC} %-10s:%-7s ${GR}|${NC} %-10s:%-19s ${GR}|${NC} %-10s:%-5s ${B}|${NC}\033[K\n" \
            "$L_SPEED" "${speed} s/s" "$L_ETA" "$eta_str" "$L_FINISH" "$finish_str"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
 
-    # Progreso Global
-    local width=50
-    local num_filled=$(echo "scale=0; $width * $percent / 100" | bc)
-    local num_empty=$((width - num_filled))
-    local filled=$(printf "%0.s#" $(seq 1 $num_filled))
-    local empty=$(printf "%0.s." $(seq 1 $num_empty))
-    
+    local width=50 num_filled num_empty filled="" empty=""
+    num_filled=$(echo "scale=0; $width * $percent / 100" | bc 2>/dev/null)
+    is_uint "$num_filled" || num_filled=0
+    [ "$num_filled" -gt "$width" ] && num_filled=$width
+    num_empty=$((width - num_filled))
+    [ "$num_filled" -gt 0 ] && filled=$(printf '%0.s#' $(seq 1 "$num_filled"))
+    [ "$num_empty" -gt 0 ] && empty=$(printf '%0.s.' $(seq 1 "$num_empty"))
+
     echo ""
     echo -e "${B}[${filled}${empty}]${NC} ${C}${percent}%${NC}\033[K"
-    echo -e "${P}[${spinner}]${NC} ${Y}$(printf "%'d" $sector)${NC} / $(printf "%'d" $total)\033[K"
-    
+    echo -e "${P}[${spinner}]${NC} ${Y}$(fmt_int "$sector")${NC} / $(fmt_int "$total")\033[K"
+
     if [ "$mode" == "SCAN" ]; then
         echo -e "${G}$L_SCAN${NC} - $status_msg\033[K"
-        echo -e "\033[J" # Limpiar resto de pantalla hacia abajo
+        echo -e "\033[J"
     else
-        # Tarjeta Reparación
         echo -e "${R}$L_REPAIR${NC} >>> SECTOR: ${W}$r_sector${NC}\033[K"
-        
-        local i_pend="${GR}[ ]${NC}"
-        local i_ok="${G}[OK]${NC}"
-        local i_fail="${R}[FAIL]${NC}"
-        local i_try="${Y}[?]${NC}"
-
-        local v_read=$i_pend; [ $st_read -eq 1 ] && v_read=$i_ok; [ $st_read -eq 2 ] && v_read=$i_fail
-        local v_resc=$i_pend; [ $st_resc -eq 1 ] && v_resc=$i_try; [ $st_resc -eq 2 ] && v_resc=$i_ok; [ $st_resc -eq 3 ] && v_resc=$i_fail
-        local v_patch=$i_pend; [ $st_patch -eq 1 ] && v_patch=$i_ok; [ $st_patch -eq 2 ] && v_patch=$i_fail
-
+        local i_pend="${GR}[ ]${NC}" i_ok="${G}[OK]${NC}" i_fail="${R}[FAIL]${NC}" i_try="${Y}[?]${NC}"
+        local v_read=$i_pend; [ "$st_read" -eq 1 ] && v_read=$i_ok; [ "$st_read" -eq 2 ] && v_read=$i_fail
+        local v_resc=$i_pend; [ "$st_resc" -eq 1 ] && v_resc=$i_try; [ "$st_resc" -eq 2 ] && v_resc=$i_ok; [ "$st_resc" -eq 3 ] && v_resc=$i_fail
+        local v_patch=$i_pend; [ "$st_patch" -eq 1 ] && v_patch=$i_ok; [ "$st_patch" -eq 2 ] && v_patch=$i_fail
         echo -e "${B}+--------------------------------------------------------+${NC}\033[K"
         printf "${B}|${NC} %-18b %-18b %-18b ${B}|${NC}\033[K\n" "$v_read $L_PH_READ" "$v_resc $L_PH_RESC" "$v_patch $L_PH_ZERO"
         echo -e "${B}+--------------------------------------------------------+${NC}\033[K"
         echo -e "${W}Status:${NC} $r_msg\033[K"
-        echo -e "\033[J" 
+        echo -e "\033[J"
     fi
 }
 
-# --- LOGICA ---
-
+# ======================== MONITOR DE BADBLOCKS ================================
 monitor_badblocks() {
-    local pid=$1
-    local total_sectors=$2
-    local spin='-\|/'
-    local i=0
-    local last_write_time=0
-
-    sleep 0.5 
-    local fd_path=$(ls -l /proc/$pid/fd 2>/dev/null | grep "$DISCO" | awk '{print $9}')
-    local fd_num=${fd_path:+$(basename $fd_path)}
+    local pid=$1 total_sectors=$2
+    local spin='-\|/' i=0 last_write_time=0
+    sleep 0.5
+    local fd_path fd_num
+    fd_path=$(ls -l /proc/$pid/fd 2>/dev/null | grep "$DISCO" | awk '{print $9}')
+    fd_num=${fd_path:+$(basename "$fd_path")}
     [ -z "$fd_num" ] && fd_num=3
 
     while kill -0 $pid 2>/dev/null; do
-        i=$(( (i+1) %4 ))
+        i=$(( (i+1) % 4 ))
         if [ -f "/proc/$pid/fdinfo/$fd_num" ]; then
-            local pos_bytes=$(grep "pos:" /proc/$pid/fdinfo/$fd_num | awk '{print $2}')
+            local pos_bytes
+            pos_bytes=$(grep "pos:" "/proc/$pid/fdinfo/$fd_num" 2>/dev/null | awk '{print $2}')
             if [[ "$pos_bytes" =~ ^[0-9]+$ ]]; then
-                local current_sector_lba=$((pos_bytes / 512))
-                SECTOR_ACTUAL=$current_sector_lba
-                
-                local current_time=$(date +%s)
-                if (( current_time - last_write_time >= BACKUP_INTERVAL )); then
-                    echo "DEVICE=$DISCO" > $STATE_FILE
-                    echo "LAST_SECTOR=$current_sector_lba" >> $STATE_FILE
-                    echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
-                    echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
-                    echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
-                    last_write_time=$current_time
+                local current_lba=$(( pos_bytes / SECTOR_SIZE ))
+                SECTOR_ACTUAL=$current_lba
+                local now; now=$(date +%s)
+                if (( now - last_write_time >= BACKUP_INTERVAL )); then
+                    write_state "$current_lba"
+                    last_write_time=$now
                 fi
-
-                draw_screen "SCAN" "$current_sector_lba" "$total_sectors" "${spin:$i:1}" "Monitorizando..." 
+                draw_screen "SCAN" "$current_lba" "$total_sectors" "${spin:$i:1}" "Monitorizando..."
             fi
         fi
         sleep 0.2
     done
 }
 
-reparar_sector() {
-    local sector=$1
-    local modo_rescate=0
-    
-    echo "DEVICE=$DISCO" > $STATE_FILE
-    echo "LAST_SECTOR=$sector" >> $STATE_FILE
-    echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
-    echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
-    echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
-
-    update_card() {
-        draw_screen "REPAIR" "$sector" "$TOTAL_SECTORS" "!" "Interviniendo..." "$sector" "$1" "$2" "$3" "$4"
-    }
-
-    update_card 0 0 0 "Analizando sector..."
-
-    start_t=$(date +%s.%N)
-    raw_output=$(hdparm --read-sector "$sector" "$DISCO" 2>&1)
-    status_read=$?
-    end_t=$(date +%s.%N)
-    duracion=$(echo "$end_t - $start_t" | bc)
-
-    procesar=0
-    if [ $status_read -ne 0 ]; then
-        echo "LOG: $sector - I/O Error" >> $LOG_FILE
-        update_card 2 0 0 "${R}Error I/O.${NC}"
-        sleep 0.5
-        procesar=1; modo_rescate=0
-    else
-        es_lento=$(echo "$duracion > $TIEMPO_MAX" | bc -l)
-        if [ "$es_lento" -eq 1 ]; then
-            echo "LOG: $sector - Slow ($duracion)" >> $LOG_FILE
-            update_card 2 1 0 "${Y}Lento (${duracion}s).${NC}"
-            sleep 0.5
-            procesar=1; modo_rescate=1
-        else
-             update_card 1 0 0 "${G}Lectura Correcta.${NC}"
-             procesar=0
-        fi
-    fi
-
-    if [ $procesar -eq 1 ]; then
-        if [ $modo_rescate -eq 1 ]; then
-            hex_dump=$(echo "$raw_output" | grep -E "^[0-9a-fA-F]{4}" | tr -d ' \r\n')
-            echo "$hex_dump" | xxd -r -p > "$BIN_TEMP"
-            if [ $(stat -c%s "$BIN_TEMP") -ne 512 ]; then
-                modo_rescate=0
-                update_card 2 3 0 "${R}Error dump size.${NC}"
-                sleep 0.5
-            fi
-        fi
-
-        update_card 2 $modo_rescate 0 "${Y}Escribiendo ceros (Remapeo)...${NC}"
-        hdparm --write-sector "$sector" --yes-i-know-what-i-am-doing "$DISCO" > /dev/null 2>&1
-        sleep 0.5
-
-        if [ $modo_rescate -eq 1 ]; then
-            update_card 2 1 0 "Restaurando datos (DD)..."
-            dd if="$BIN_TEMP" of="$DISCO" bs=512 count=1 seek="$sector" conv=fdatasync status=none
-            if [ $? -eq 0 ]; then
-                ((TOTAL_SALVADOS++))
-                echo "LOG: $sector - Saved" >> $LOG_FILE
-                update_card 2 2 1 "${G}¡Dato Salvado!${NC}"
-            else
-                 hdparm --write-sector "$sector" --yes-i-know-what-i-am-doing "$DISCO" > /dev/null 2>&1
-                 ((TOTAL_CEROS++))
-                 echo "LOG: $sector - Zeroed (Restore fail)" >> $LOG_FILE
-                 update_card 2 3 1 "${Y}Fallo Restore. Ceros aplicados.${NC}"
-            fi
-        else
-            hdparm --read-sector "$sector" "$DISCO" > /dev/null 2>&1
-            if [ $? -eq 0 ]; then
-                ((TOTAL_CEROS++))
-                echo "LOG: $sector - Zeroed" >> $LOG_FILE
-                update_card 2 0 1 "${Y}Sector recuperado (Ceros).${NC}"
-            else
-                ((TOTAL_FALLIDOS++))
-                 echo "LOG: $sector - FAILED" >> $LOG_FILE
-                 update_card 2 0 2 "${R}FALLO FÍSICO PERMANENTE.${NC}"
-            fi
-        fi
-    fi
-    sleep 0.5
+# =================== REPARACIÓN DE SECTOR (núcleo seguro) =====================
+write_and_verify() {
+    local sector=$1 src=$2
+    dd if="$src" of="$DISCO" bs="$SECTOR_SIZE" seek="$sector" count=1 \
+       conv=fdatasync,notrunc oflag=direct status=none 2>/dev/null
+    local wst=$?
+    [ $wst -ne 0 ] && return 2
+    read_sector_dd "$sector" "$BIN_VERIFY" || return 3
+    cmp -s "$src" "$BIN_VERIFY" && return 0
+    return 1
 }
 
-# --- MAIN ---
-TOTAL_SECTORS=$(blockdev --getsz $DISCO)
-START_SECTOR=0
+zero_sector() {
+    local sector=$1
+    dd if=/dev/zero of="$DISCO" bs="$SECTOR_SIZE" seek="$sector" count=1 \
+       conv=fdatasync,notrunc oflag=direct status=none 2>/dev/null
+    read_sector_dd "$sector" "$BIN_VERIFY"
+}
 
-if [ -f "$STATE_FILE" ]; then
-    source $STATE_FILE
-    if [ "$DEVICE" == "$DISCO" ]; then
-        START_SECTOR=$LAST_SECTOR
-        SESSION_START_SECTOR=$LAST_SECTOR
-        TOTAL_SALVADOS=${STATS_SALVADOS:-0}
-        TOTAL_CEROS=${STATS_CEROS:-0}
-        TOTAL_FALLIDOS=${STATS_FALLIDOS:-0}
+reparar_sector() {
+    local sector=$1
+    write_state "$sector"
+
+    update_card() { draw_screen "REPAIR" "$sector" "$TOTAL_SECTORS" "!" "Interviniendo..." "$sector" "$1" "$2" "$3" "$4"; }
+    update_card 0 0 0 "Leyendo (dd + hdparm)..."
+
+    local t0 t1 dur
+    t0=$(date +%s.%N)
+    read_sector_dd "$sector" "$BIN_DD"; local st_dd=$?
+    read_sector_hdparm "$sector" "$BIN_HDP"; local st_hdp=$?
+    t1=$(date +%s.%N)
+    dur=$(echo "$t1 - $t0" | bc 2>/dev/null); [ -z "$dur" ] && dur=0
+
+    local dd_ok=0 hdp_ok=0
+    { [ $st_dd -eq 0 ] && [ -s "$BIN_DD" ]; } && dd_ok=1
+    { [ $st_hdp -eq 0 ] && [ -s "$BIN_HDP" ]; } && hdp_ok=1
+
+    local es_lento=0
+    es_lento=$(echo "$dur > $TIEMPO_MAX" | bc -l 2>/dev/null); [ -z "$es_lento" ] && es_lento=0
+
+    local good_buf="" dudoso=0
+
+    if [ $dd_ok -eq 1 ] && [ $hdp_ok -eq 1 ]; then
+        if cmp -s "$BIN_DD" "$BIN_HDP"; then
+            good_buf="$BIN_DD"
+        else
+            update_card 1 1 0 "${Y}Discrepancia. 3a lectura (voto)...${NC}"
+            read_sector_dd "$sector" "$BIN_VOTE"
+            if [ -s "$BIN_VOTE" ] && cmp -s "$BIN_VOTE" "$BIN_DD"; then
+                good_buf="$BIN_DD"
+            elif [ -s "$BIN_VOTE" ] && cmp -s "$BIN_VOTE" "$BIN_HDP"; then
+                good_buf="$BIN_HDP"
+            else
+                local z_dd z_hdp
+                z_dd=$(tr -d '\000' < "$BIN_DD" | wc -c)
+                z_hdp=$(tr -d '\000' < "$BIN_HDP" | wc -c)
+                if [ "$z_hdp" -gt "$z_dd" ]; then good_buf="$BIN_HDP"; else good_buf="$BIN_DD"; fi
+            fi
+            dudoso=1
+            ((TOTAL_DUDOSOS++))
+            mkdir -p "$RESCUE_DIR"
+            cp -f "$BIN_DD"  "$RESCUE_DIR/sector_${sector}_dd.bin"
+            cp -f "$BIN_HDP" "$RESCUE_DIR/sector_${sector}_hdparm.bin"
+            log_msg "Sector $sector: DISCREPANCIA dd/hdparm. Copias conservadas en $RESCUE_DIR. Dato DUDOSO."
+        fi
+    elif [ $dd_ok -eq 1 ]; then
+        good_buf="$BIN_DD"
+    elif [ $hdp_ok -eq 1 ]; then
+        good_buf="$BIN_HDP"
     else
-        rm $STATE_FILE
+        good_buf=""
+    fi
+
+    if [ -n "$good_buf" ]; then
+        if [ "$es_lento" -eq 1 ] || [ "$dudoso" -eq 1 ]; then
+            update_card 2 1 0 "${Y}Reescribiendo dato (refresco/remapeo)...${NC}"
+            if write_and_verify "$sector" "$good_buf"; then
+                ((TOTAL_SALVADOS++))
+                local extra=""; [ "$dudoso" -eq 1 ] && extra=" (DUDOSO)"
+                log_msg "Sector $sector: SALVADO por reescritura directa (lento=${dur}s)$extra"
+                update_card 2 2 1 "${G}Dato reescrito y verificado.${NC}"
+            else
+                mkdir -p "$RESCUE_DIR"
+                cp -f "$good_buf" "$RESCUE_DIR/sector_${sector}_FAILED_VERIFY.bin"
+                ((TOTAL_FALLIDOS++))
+                log_msg "Sector $sector: FALLO de verificación post-escritura. Copia conservada en $RESCUE_DIR."
+                update_card 2 3 2 "${R}Fallo verificación. Copia conservada.${NC}"
+            fi
+        else
+            update_card 1 0 0 "${G}Lectura correcta. Sin intervención.${NC}"
+        fi
+    else
+        update_card 2 0 0 "${Y}Sector ilegible. Escribiendo ceros (remapeo)...${NC}"
+        if zero_sector "$sector"; then
+            ((TOTAL_CEROS++))
+            log_msg "Sector $sector: ilegible -> ceros escritos, sector ahora legible (remapeado/curado)."
+            update_card 2 0 1 "${Y}Remapeado (ceros). Dato original perdido.${NC}"
+        else
+            ((TOTAL_FALLIDOS++))
+            log_msg "Sector $sector: FALLO FÍSICO PERMANENTE (ni tras ceros es legible)."
+            update_card 2 0 2 "${R}FALLO FÍSICO PERMANENTE.${NC}"
+        fi
+    fi
+
+    rm -f "$BIN_DD" "$BIN_HDP" "$BIN_VOTE" "$BIN_VERIFY" 2>/dev/null
+    sleep 0.4
+}
+
+# ================================ MAIN ========================================
+clear
+check_root
+check_utils
+check_device "${1:-}"
+check_not_mounted
+detect_sector_size
+validate_unit_coherence
+
+mkdir -p "$RESCUE_DIR"
+log_msg "===== INICIO sesión sobre $DISCO (sector=${SECTOR_SIZE}, total=${TOTAL_SECTORS}) ====="
+show_smart "INICIO"
+
+echo -e "\n${Y}Pulsa ENTER para comenzar el escaneo (Ctrl+C para abortar).${NC}"
+read -r _
+
+tput civis 2>/dev/null
+
+START_SECTOR=0
+if [ -f "$STATE_FILE" ]; then
+    st_device=$(read_state_value "DEVICE")
+    st_last=$(read_state_value "LAST_SECTOR")
+    if [ "$st_device" == "$DISCO" ] && is_uint "$st_last" \
+       && [ "$st_last" -ge 0 ] && [ "$st_last" -le "$TOTAL_SECTORS" ]; then
+        START_SECTOR=$st_last
+        SESSION_START_SECTOR=$st_last
+        v=$(read_state_value "STATS_SALVADOS");  is_uint "$v" && TOTAL_SALVADOS=$v
+        v=$(read_state_value "STATS_CEROS");     is_uint "$v" && TOTAL_CEROS=$v
+        v=$(read_state_value "STATS_FALLIDOS");  is_uint "$v" && TOTAL_FALLIDOS=$v
+        v=$(read_state_value "STATS_DUDOSOS");   is_uint "$v" && TOTAL_DUDOSOS=$v
+        echo -e "${G}Reanudando desde sector $START_SECTOR.${NC}"
+    else
+        echo -e "${Y}Estado previo inválido o de otro disco. Empezando de cero.${NC}"
+        rm -f "$STATE_FILE"
     fi
 fi
 
 if [ -s "$PENDING_FILE" ]; then
-    while IFS= read -r pending_sector; do
-        reparar_sector "$pending_sector"
+    while IFS= read -r ps; do
+        is_uint "$ps" && reparar_sector "$ps"
         sed -i "1d" "$PENDING_FILE"
     done < "$PENDING_FILE"
     rm -f "$PENDING_FILE"
 fi
 
 CHUNK_SIZE=$(echo "$TOTAL_SECTORS * $CHUNK_PERCENT / 100" | bc)
-if [ "$CHUNK_SIZE" -lt 2048 ]; then CHUNK_SIZE=2048; fi 
+[ "$CHUNK_SIZE" -lt 2048 ] && CHUNK_SIZE=2048
 
 clear
 CURRENT=$START_SECTOR
-
-while [ $CURRENT -lt $TOTAL_SECTORS ]; do
+while [ "$CURRENT" -lt "$TOTAL_SECTORS" ]; do
     END=$((CURRENT + CHUNK_SIZE))
-    if [ $END -gt $TOTAL_SECTORS ]; then END=$TOTAL_SECTORS; fi
-    
-    badblocks -b 512 -s $DISCO $END $CURRENT > $TEMP_LIST 2> /dev/null &
-    PID_BB=$!
-    
-    monitor_badblocks $PID_BB $TOTAL_SECTORS
+    [ "$END" -gt "$TOTAL_SECTORS" ] && END=$TOTAL_SECTORS
 
-    if [ -s $TEMP_LIST ]; then
-        cat "$TEMP_LIST" > .current_chunk_list
+    # badblocks SOLO LECTURA (-s). NUNCA usar -w (destructivo).
+    badblocks -b "$SECTOR_SIZE" -s "$DISCO" "$END" "$CURRENT" > "$TEMP_LIST" 2>/dev/null &
+    PID_BB=$!
+    monitor_badblocks "$PID_BB" "$TOTAL_SECTORS"
+
+    if [ -s "$TEMP_LIST" ]; then
+        cp "$TEMP_LIST" .current_chunk_list
         while IFS= read -r bad_sector; do
-            reparar_sector "$bad_sector"
-            sed -i "/^$bad_sector$/d" "$TEMP_LIST"
+            is_uint "$bad_sector" && reparar_sector "$bad_sector"
+            sed -i "/^${bad_sector}$/d" "$TEMP_LIST"
         done < .current_chunk_list
-        rm .current_chunk_list
-        > $TEMP_LIST
+        rm -f .current_chunk_list
+        : > "$TEMP_LIST"
     fi
 
     CURRENT=$END
-    
-    echo "DEVICE=$DISCO" > $STATE_FILE
-    echo "LAST_SECTOR=$CURRENT" >> $STATE_FILE
-    echo "STATS_SALVADOS=$TOTAL_SALVADOS" >> $STATE_FILE
-    echo "STATS_CEROS=$TOTAL_CEROS" >> $STATE_FILE
-    echo "STATS_FALLIDOS=$TOTAL_FALLIDOS" >> $STATE_FILE
+    write_state "$CURRENT"
 done
 
 clear
 draw_screen "SCAN" "$TOTAL_SECTORS" "$TOTAL_SECTORS" "OK" "PROCESO FINALIZADO" 0 0 0 0 ""
-echo -e "\n${G}FINALIZADO${NC}"
-rm -f $STATE_FILE
+show_smart "FIN"
+smart_compare
+log_msg "===== FIN sesión. Salvados=$TOTAL_SALVADOS Ceros=$TOTAL_CEROS Fallidos=$TOTAL_FALLIDOS Dudosos=$TOTAL_DUDOSOS ====="
+echo -e "\n${G}FINALIZADO${NC}  (log: $LOG_FILE | copias dudosas: $RESCUE_DIR)"
+rm -f "$STATE_FILE"
