@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  DISK HEALER v7.2.3 - SAFE REPAIR EDITION
+#  DISK HEALER v7.2.4 - SAFE REPAIR EDITION
 #  Reescritura centrada en evitar pérdida de datos:
 #   - Lectura cruzada (dd + hdparm) con decisión por status y desempate por voto
 #   - Restauración directa de la copia en sectores lentos (sin ceros intermedios)
@@ -34,6 +34,18 @@ REPAIR_NEIGHBORS=8                   # tras reparar, reintentar ±N sectores por
 # manteniendo la relación 8/10 que se pidió: kernel=10 -> script=8.
 IO_TIMEOUT=10                        # por defecto 10s; se puede cambiar con -t
 OP_TIMEOUT=8                         # se recalcula tras parsear -t
+
+# Validación de coherencia de unidad dd/hdparm al arranque.
+# Si SKIP_UNIT_CHECK=1, la comprobación SE SIGUE HACIENDO pero, si falla,
+# NO aborta: muestra "IGNORADO" en rojo y continúa.
+SKIP_UNIT_CHECK=0
+
+# Método de lectura para la verificación cruzada de sectores:
+#   both   -> lee con dd Y hdparm y los contrasta (por defecto, más seguro)
+#   dd     -> usa solo dd como fuente de verdad
+#   hdparm -> usa solo hdparm como fuente de verdad
+# Útil cuando uno de los dos no es capaz de leer el disco en este hardware.
+READER="both"
 
 # Detección de dispositivo (rellenadas en runtime)
 SMART_DOPT=""                        # opción -d para smartctl (sat/auto/"")
@@ -257,7 +269,7 @@ check_utils() {
 
 show_help() {
     cat <<EOF
-DISK HEALER v7.2.3 - Reparación segura de sectores defectuosos
+DISK HEALER v7.2.4 - Reparación segura de sectores defectuosos
 
 Uso: $0 [opciones] <device>
 
@@ -291,6 +303,15 @@ Opciones:
       --ascii              Fuerza la interfaz ASCII (por defecto). Compatible
                            con cualquier terminal, incluido PuTTY sin UTF-8.
 
+      --skip-unit-check    No abortar si la validación de unidad dd/hdparm falla.
+                           La comprobación se sigue haciendo y se registra en
+                           detalle, pero muestra "IGNORADO" en rojo y continúa.
+                           Útil si uno de los dos no puede leer este disco.
+
+      --reader <m>         Método de lectura de sectores: both (def., contrasta
+                           dd y hdparm), dd (solo dd) o hdparm (solo hdparm).
+                           Usa dd o hdparm si el otro no funciona en tu hardware.
+
   -h, --help               Muestra esta ayuda y sale.
 
 Comportamiento por defecto (sin -r ni -e): escanea en chunks del ${CHUNK_PERCENT}% y
@@ -323,6 +344,16 @@ parse_args() {
                 ;;
             --ascii)
                 UI_CHARSET="ascii"
+                ;;
+            --skip-unit-check)
+                SKIP_UNIT_CHECK=1
+                ;;
+            --reader)
+                shift
+                case "${1:-}" in
+                    both|dd|hdparm) READER="$1" ;;
+                    *) abort "El valor de --reader debe ser: both, dd o hdparm." ;;
+                esac
                 ;;
             -b|--block)
                 shift
@@ -507,23 +538,59 @@ validate_unit_coherence() {
     echo -e "${C}Validando coherencia de unidades hdparm/dd...${NC}"
     local test_sector=$(( TOTAL_SECTORS / 2 ))
     local ok=0 tries=0
+    local last_dd_st=- last_hdp_st=- last_dd_sz=0 last_hdp_sz=0 last_sector=0
     while [ $tries -lt 5 ]; do
-        if read_sector_dd "$test_sector" "$BIN_DD" \
-           && read_sector_hdparm "$test_sector" "$BIN_HDP" \
-           && [ -s "$BIN_DD" ] && [ -s "$BIN_HDP" ]; then
-            if cmp -s "$BIN_DD" "$BIN_HDP"; then
-                ok=1; break
-            fi
+        last_sector=$test_sector
+        read_sector_dd "$test_sector" "$BIN_DD"; last_dd_st=$?
+        read_sector_hdparm "$test_sector" "$BIN_HDP"; last_hdp_st=$?
+        last_dd_sz=$( [ -f "$BIN_DD" ] && stat -c%s "$BIN_DD" 2>/dev/null || echo 0 )
+        last_hdp_sz=$( [ -f "$BIN_HDP" ] && stat -c%s "$BIN_HDP" 2>/dev/null || echo 0 )
+        if [ "$last_dd_st" -eq 0 ] && [ "$last_hdp_st" -eq 0 ] \
+           && [ -s "$BIN_DD" ] && [ -s "$BIN_HDP" ] && cmp -s "$BIN_DD" "$BIN_HDP"; then
+            ok=1; break
         fi
         test_sector=$(( test_sector + 1000 ))
         [ "$test_sector" -ge "$TOTAL_SECTORS" ] && break
         tries=$((tries+1))
     done
-    if [ $ok -ne 1 ]; then
-        abort "hdparm y dd NO coinciden en la unidad de sector. Abortado para no corromper datos. Revisa manualmente."
+
+    if [ $ok -eq 1 ]; then
+        echo -e "${G}OK:${NC} hdparm y dd interpretan el sector de forma idéntica."
+        rm -f "$BIN_DD" "$BIN_HDP"
+        return 0
     fi
-    echo -e "${G}OK:${NC} hdparm y dd interpretan el sector de forma idéntica."
+
+    # --- Falló la validación: log detallado completo ---
+    local dd_hex hdp_hex
+    dd_hex=$( [ -s "$BIN_DD" ]  && xxd "$BIN_DD"  2>/dev/null | head -2 | tr '\n' ' ' || echo "(vacío)" )
+    hdp_hex=$( [ -s "$BIN_HDP" ] && xxd "$BIN_HDP" 2>/dev/null | head -2 | tr '\n' ' ' || echo "(vacío)" )
+    log_msg "VALIDACION UNIDAD FALLIDA en sector $last_sector:"
+    log_msg "  dd     -> status=$last_dd_st  bytes=$last_dd_sz  hex: $dd_hex"
+    log_msg "  hdparm -> status=$last_hdp_st bytes=$last_hdp_sz hex: $hdp_hex"
+
+    # Mostrar el detalle también en pantalla
+    echo -e "${R}Discrepancia/fallo de lectura en la validación (sector $last_sector):${NC}"
+    echo -e "  ${C}dd${NC}     -> status=${last_dd_st}  bytes=${last_dd_sz}"
+    echo -e "  ${C}hdparm${NC} -> status=${last_hdp_st} bytes=${last_hdp_sz}"
+    echo -e "  ${GR}(detalle hex en el log: $LOG_FILE)${NC}"
+
+    if [ "$SKIP_UNIT_CHECK" -eq 1 ]; then
+        echo -e "${R}IGNORADO${NC} (--skip-unit-check). Se continúa BAJO TU RESPONSABILIDAD."
+        # Si el usuario no forzó un lector concreto, sugerir el que sí leyó
+        if [ "$READER" = "both" ]; then
+            if [ "$last_dd_st" -eq 0 ] && [ "$last_hdp_st" -ne 0 ]; then
+                echo -e "${Y}Sugerencia:${NC} dd pudo leer y hdparm no. Considera --reader dd."
+            elif [ "$last_hdp_st" -eq 0 ] && [ "$last_dd_st" -ne 0 ]; then
+                echo -e "${Y}Sugerencia:${NC} hdparm pudo leer y dd no. Considera --reader hdparm."
+            fi
+        fi
+        log_msg "Validación de unidad IGNORADA por --skip-unit-check. READER=$READER"
+        rm -f "$BIN_DD" "$BIN_HDP"
+        return 1
+    fi
+
     rm -f "$BIN_DD" "$BIN_HDP"
+    abort "hdparm y dd NO coinciden / no pudieron leer. Abortado para no corromper datos. Usa --skip-unit-check para forzar (y --reader dd|hdparm)."
 }
 
 # ================================ SMART =======================================
@@ -616,7 +683,7 @@ draw_screen() {
     # Encabezado
     echo -e "${B}${BX_TL}${HBAR}${BX_TR}${NC}\033[K"
     printf "${B}${BX_VL}${NC} ${W}%-22s${NC} ${GR}${BX_SEP}${NC} ${C}%-47s${NC} ${B}${BX_VL}${NC}\033[K\n" \
-           "DISK HEALER v7.2.3" "$DISCO"
+           "DISK HEALER v7.2.4" "$DISCO"
     echo -e "${B}${BX_ML}${HBAR}${BX_MR}${NC}\033[K"
 
     # Fila de estadísticas (5 contadores)
@@ -739,8 +806,14 @@ reparar_sector() {
 
     local t0 t1 dur
     t0=$(date +%s.%N)
-    read_sector_dd "$sector" "$BIN_DD"; local st_dd=$?
-    read_sector_hdparm "$sector" "$BIN_HDP"; local st_hdp=$?
+    local st_dd=1 st_hdp=1
+    # Leer según el método elegido (both = cruzado; dd/hdparm = único)
+    if [ "$READER" = "dd" ] || [ "$READER" = "both" ]; then
+        read_sector_dd "$sector" "$BIN_DD"; st_dd=$?
+    fi
+    if [ "$READER" = "hdparm" ] || [ "$READER" = "both" ]; then
+        read_sector_hdparm "$sector" "$BIN_HDP"; st_hdp=$?
+    fi
     t1=$(date +%s.%N)
     dur=$(echo "$t1 - $t0" | bc 2>/dev/null); [ -z "$dur" ] && dur=0
 
@@ -753,7 +826,13 @@ reparar_sector() {
 
     local good_buf="" dudoso=0
 
-    if [ $dd_ok -eq 1 ] && [ $hdp_ok -eq 1 ]; then
+    if [ "$READER" = "dd" ]; then
+        # Solo dd como fuente de verdad
+        [ $dd_ok -eq 1 ] && good_buf="$BIN_DD"
+    elif [ "$READER" = "hdparm" ]; then
+        # Solo hdparm como fuente de verdad
+        [ $hdp_ok -eq 1 ] && good_buf="$BIN_HDP"
+    elif [ $dd_ok -eq 1 ] && [ $hdp_ok -eq 1 ]; then
         if cmp -s "$BIN_DD" "$BIN_HDP"; then
             good_buf="$BIN_DD"
         else
@@ -774,12 +853,18 @@ reparar_sector() {
             mkdir -p "$RESCUE_DIR"
             cp -f "$BIN_DD"  "$RESCUE_DIR/sector_${sector}_dd.bin"
             cp -f "$BIN_HDP" "$RESCUE_DIR/sector_${sector}_hdparm.bin"
-            log_msg "Sector $sector: DISCREPANCIA dd/hdparm. Copias conservadas en $RESCUE_DIR. Dato DUDOSO."
+            # Log detallado de la discrepancia (status y tamaño de cada lector)
+            local szdd szhdp
+            szdd=$(stat -c%s "$BIN_DD" 2>/dev/null || echo 0)
+            szhdp=$(stat -c%s "$BIN_HDP" 2>/dev/null || echo 0)
+            log_msg "Sector $sector: DISCREPANCIA dd/hdparm (dd: status=$st_dd bytes=$szdd | hdparm: status=$st_hdp bytes=$szhdp). Copias en $RESCUE_DIR. Dato DUDOSO."
         fi
     elif [ $dd_ok -eq 1 ]; then
         good_buf="$BIN_DD"
+        log_msg "Sector $sector: solo dd pudo leer (hdparm status=$st_hdp). Usando dd."
     elif [ $hdp_ok -eq 1 ]; then
         good_buf="$BIN_HDP"
+        log_msg "Sector $sector: solo hdparm pudo leer (dd status=$st_dd). Usando hdparm."
     else
         good_buf=""
     fi
@@ -923,6 +1008,7 @@ else
     echo -e "\n${C}Modo:${NC} reparación por bloques. Pasada de reparación cada ${CHUNK_PERCENT}% del disco."
 fi
 echo -e "${C}Timeout:${NC} kernel=${IO_TIMEOUT}s / operación=${OP_TIMEOUT}s"
+echo -e "${C}Lector:${NC} ${READER}$( [ "$SKIP_UNIT_CHECK" -eq 1 ] && echo "  ${R}(validación de unidad: IGNORADA)${NC}" )"
 if [ "${USE_UNICODE:-0}" -eq 1 ]; then
     echo -e "${C}Interfaz:${NC} Unicode forzado (-u). Si ves '?', tu terminal no soporta UTF-8: usa --ascii."
 else
