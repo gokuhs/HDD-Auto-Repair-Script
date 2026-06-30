@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  DISK HEALER v7.0 - SAFE REPAIR EDITION
+#  DISK HEALER v7.1 - SAFE REPAIR EDITION
 #  Reescritura centrada en evitar pérdida de datos:
 #   - Lectura cruzada (dd + hdparm) con decisión por status y desempate por voto
 #   - Restauración directa de la copia en sectores lentos (sin ceros intermedios)
@@ -450,7 +450,7 @@ draw_screen() {
 
     printf "\033[H"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} %-25s ${GR}|${NC} %-41s ${B}|${NC}\033[K\n" "${W}DISK HEALER v7.0${NC}" "${C}$DISCO${NC}"
+    printf "${B}|${NC} ${W}%-25s${NC} ${GR}|${NC} ${C}%-41s${NC} ${B}|${NC}\033[K\n" "DISK HEALER v7.1" "$DISCO"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
     printf "${B}|${NC} ${G}%-9s${NC}:%-4d ${GR}|${NC} ${Y}%-6s${NC}:%-4d ${GR}|${NC} ${R}%-8s${NC}:%-4d ${GR}|${NC} ${C}%-7s${NC}:%-4d ${GR}|${NC} ${P}%-9s${NC}:%-4d ${B}|${NC}\033[K\n" \
            "$L_SAVED" "${TOTAL_SALVADOS:-0}" \
@@ -661,12 +661,7 @@ mkdir -p "$RESCUE_DIR"
 log_msg "===== INICIO sesión sobre $DISCO (sector=${SECTOR_SIZE}, total=${TOTAL_SECTORS}, timeout=${IO_TIMEOUT}s) ====="
 show_smart "INICIO"
 
-echo -e "\n${Y}Pulsa ENTER para comenzar el escaneo (Ctrl+C para abortar).${NC}"
-# El '|| exit 130' garantiza que un Ctrl+C durante la espera salga limpio
-read -r _ || exit 130
-
-tput civis 2>/dev/null
-
+# --- Detección de reanudación (antes del ENTER, para que el aviso sea visible) ---
 START_SECTOR=0
 if [ -f "$STATE_FILE" ]; then
     st_device=$(read_state_value "DEVICE")
@@ -679,12 +674,21 @@ if [ -f "$STATE_FILE" ]; then
         v=$(read_state_value "STATS_CEROS");     is_uint "$v" && TOTAL_CEROS=$v
         v=$(read_state_value "STATS_FALLIDOS");  is_uint "$v" && TOTAL_FALLIDOS=$v
         v=$(read_state_value "STATS_DUDOSOS");   is_uint "$v" && TOTAL_DUDOSOS=$v
-        echo -e "${G}Reanudando desde sector $START_SECTOR.${NC}"
+        local_pct=$(echo "scale=1; $START_SECTOR * 100 / $TOTAL_SECTORS" | bc 2>/dev/null)
+        echo -e "\n${G}>>> SESIÓN ANTERIOR DETECTADA <<<${NC}"
+        echo -e "${G}    Reanudando desde el sector $START_SECTOR (${local_pct}% del disco).${NC}"
+        echo -e "${GR}    Para empezar de cero: borra .disk_healer_state y relanza.${NC}"
     else
-        echo -e "${Y}Estado previo inválido o de otro disco. Empezando de cero.${NC}"
+        echo -e "\n${Y}Estado previo inválido o de otro disco. Empezando de cero.${NC}"
         rm -f "$STATE_FILE"
     fi
 fi
+
+echo -e "\n${Y}Pulsa ENTER para comenzar el escaneo (Ctrl+C para abortar).${NC}"
+# El '|| exit 130' garantiza que un Ctrl+C durante la espera salga limpio
+read -r _ || exit 130
+
+tput civis 2>/dev/null
 
 if [ -s "$PENDING_FILE" ]; then
     while IFS= read -r ps; do
