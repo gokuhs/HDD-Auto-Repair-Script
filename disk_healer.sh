@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  DISK HEALER v7.2.2 - SAFE REPAIR EDITION
+#  DISK HEALER v7.2.3 - SAFE REPAIR EDITION
 #  Reescritura centrada en evitar pérdida de datos:
 #   - Lectura cruzada (dd + hdparm) con decisión por status y desempate por voto
 #   - Restauración directa de la copia en sectores lentos (sin ceros intermedios)
@@ -90,18 +90,19 @@ detect_language() {
 }
 detect_language
 
-# --- AUTODETECCIÓN DE CARACTERES DE CAJA (Unicode si el terminal lo soporta) ---
-# Si el locale efectivo es UTF-8, usamos caja Unicode; si no, ASCII.
-# Esto evita los '?' cuando se ejecuta como root con locale C/POSIX.
-detect_box_charset() {
-    local cmap
-    cmap=$(locale charmap 2>/dev/null)
-    if [ "$cmap" = "UTF-8" ] || [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *"UTF-8"* ]] || [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *"utf8"* ]]; then
+# --- MODO DE CARACTERES DE CAJA ---
+# Por defecto ASCII (seguro en cualquier terminal, incluido PuTTY sin UTF-8).
+# Se puede forzar Unicode con -u/--unicode o ASCII con --ascii.
+# No se autodetecta porque el servidor NO puede saber cómo está configurado el
+# terminal CLIENTE (p.ej. PuTTY puede tener LANG=UTF-8 pero no decodificar UTF-8).
+UI_CHARSET="ascii"   # "ascii" | "unicode"; lo ajustan los flags
+
+apply_box_charset() {
+    if [ "$UI_CHARSET" = "unicode" ]; then
         USE_UNICODE=1
-        BX_TL='?'; BX_TR='?'; BX_BL='?'; BX_BR='?'; BX_HZ='?'; BX_VL='?'; BX_ML='?'; BX_MR='?'; BX_SEP='?'
-        BX_FILL='?'; BX_EMPTY='?'; BX_ARROW='»'; BX_FAIL='?'
-        # caja secundaria (tarjeta de reparación)
-        BX_TL2='?'; BX_TR2='?'; BX_BL2='?'; BX_BR2='?'; BX_HZ2='?'; BX_VL2='?'
+        BX_TL='╔'; BX_TR='╗'; BX_BL='╚'; BX_BR='╝'; BX_HZ='═'; BX_VL='║'; BX_ML='╠'; BX_MR='╣'; BX_SEP='│'
+        BX_FILL='█'; BX_EMPTY='░'; BX_ARROW='»'; BX_FAIL='✗'
+        BX_TL2='┌'; BX_TR2='┐'; BX_BL2='└'; BX_BR2='┘'; BX_HZ2='─'; BX_VL2='│'
     else
         USE_UNICODE=0
         BX_TL='+'; BX_TR='+'; BX_BL='+'; BX_BR='+'; BX_HZ='='; BX_VL='|'; BX_ML='+'; BX_MR='+'; BX_SEP='|'
@@ -109,7 +110,8 @@ detect_box_charset() {
         BX_TL2='+'; BX_TR2='+'; BX_BL2='+'; BX_BR2='+'; BX_HZ2='-'; BX_VL2='|'
     fi
 }
-detect_box_charset
+# se aplica tras parsear los flags (en MAIN); aquí dejamos un default seguro
+apply_box_charset
 
 # ============================== LOGGING =======================================
 log_msg() {
@@ -255,7 +257,7 @@ check_utils() {
 
 show_help() {
     cat <<EOF
-DISK HEALER v7.2.2 - Reparación segura de sectores defectuosos
+DISK HEALER v7.2.3 - Reparación segura de sectores defectuosos
 
 Uso: $0 [opciones] <device>
 
@@ -280,6 +282,14 @@ Opciones:
   -e, --repair-every <pct> Porcentaje del disco que se escanea antes de cada
                            pasada de reparación (def. ${CHUNK_PERCENT}). Acepta decimales
                            (ej. 0.5). Sin efecto si se usa --repair-now.
+
+  -u, --unicode            Fuerza la interfaz con caja Unicode (TUI bonita).
+                           Úsalo solo si tu terminal soporta UTF-8 (terminal
+                           Linux nativo, o PuTTY con Window > Translation >
+                           Remote character set: UTF-8).
+
+      --ascii              Fuerza la interfaz ASCII (por defecto). Compatible
+                           con cualquier terminal, incluido PuTTY sin UTF-8.
 
   -h, --help               Muestra esta ayuda y sale.
 
@@ -307,6 +317,12 @@ parse_args() {
                 ;;
             -r|--repair-now)
                 REPAIR_NOW=1
+                ;;
+            -u|--unicode)
+                UI_CHARSET="unicode"
+                ;;
+            --ascii)
+                UI_CHARSET="ascii"
                 ;;
             -b|--block)
                 shift
@@ -344,6 +360,8 @@ parse_args() {
     [ "$OP_TIMEOUT" -lt 1 ] && OP_TIMEOUT=1
     # MB del bloque híbrido (para mostrar en la UI sin recalcular cada refresco)
     HYBRID_BLOCK_BYTES_MB=$(( HYBRID_BLOCK_BYTES / 1024 / 1024 ))
+    # Aplicar el modo de caracteres elegido por los flags
+    apply_box_charset
 }
 
 check_not_mounted() {
@@ -598,7 +616,7 @@ draw_screen() {
     # Encabezado
     echo -e "${B}${BX_TL}${HBAR}${BX_TR}${NC}\033[K"
     printf "${B}${BX_VL}${NC} ${W}%-22s${NC} ${GR}${BX_SEP}${NC} ${C}%-47s${NC} ${B}${BX_VL}${NC}\033[K\n" \
-           "DISK HEALER v7.2.2" "$DISCO"
+           "DISK HEALER v7.2.3" "$DISCO"
     echo -e "${B}${BX_ML}${HBAR}${BX_MR}${NC}\033[K"
 
     # Fila de estadísticas (5 contadores)
@@ -906,9 +924,9 @@ else
 fi
 echo -e "${C}Timeout:${NC} kernel=${IO_TIMEOUT}s / operación=${OP_TIMEOUT}s"
 if [ "${USE_UNICODE:-0}" -eq 1 ]; then
-    echo -e "${C}Interfaz:${NC} Unicode (caja TUI)"
+    echo -e "${C}Interfaz:${NC} Unicode forzado (-u). Si ves '?', tu terminal no soporta UTF-8: usa --ascii."
 else
-    echo -e "${C}Interfaz:${NC} ASCII (terminal sin soporte Unicode detectado)"
+    echo -e "${C}Interfaz:${NC} ASCII (compatible con todo). Para caja Unicode: -u (requiere terminal UTF-8)."
 fi
 
 # --- Detección de reanudación (antes del ENTER, para que el aviso sea visible) ---
