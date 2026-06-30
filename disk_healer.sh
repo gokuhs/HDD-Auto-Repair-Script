@@ -213,7 +213,15 @@ read_sector_hdparm() {
         : > "$out"
         return $st
     fi
-    echo "$raw" | grep -Eo '([0-9a-fA-F]{4} ){1,}' | tr -d ' \r\n' | xxd -r -p > "$out"
+    # hdparm imprime el dump como líneas de words hex de 4 dígitos.
+    # 1) seleccionar SOLO las líneas que son puro dump (descarta cabecera "reading...").
+    # 2) extraer CADA word de 4 hex (incluido el último de la línea, que no lleva
+    #    espacio detrás -> la regex antigua lo perdía y devolvía <512 bytes).
+    echo "$raw" \
+        | grep -iE '^([[:space:]]*[0-9a-f]{4})+[[:space:]]*$' \
+        | grep -oiE '[0-9a-f]{4}' \
+        | tr -d '\n' \
+        | xxd -r -p > "$out"
     return 0
 }
 
