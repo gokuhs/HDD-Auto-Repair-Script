@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  DISK HEALER v7.1 - SAFE REPAIR EDITION
+#  DISK HEALER v7.2 - SAFE REPAIR EDITION
 #  Reescritura centrada en evitar pérdida de datos:
 #   - Lectura cruzada (dd + hdparm) con decisión por status y desempate por voto
 #   - Restauración directa de la copia en sectores lentos (sin ceros intermedios)
@@ -17,9 +17,17 @@ set -uo pipefail
 # esperados (encontrar bloque malo, leer sector dañado) que NO son errores fatales.
 
 # --- CONFIG ---
-CHUNK_PERCENT=2
+CHUNK_PERCENT=2                      # % del disco por chunk de escaneo (def. 2). -e lo cambia.
 TIEMPO_MAX=1.0                       # umbral (s) para considerar un sector "lento"
 BACKUP_INTERVAL=10                   # cada cuántos seg se persiste el estado en escaneo
+
+# Modo "reparar nada más encontrarlos" (-r). Cuando está activo, el chunk se
+# fija al mínimo razonable (REPAIR_NOW_CHUNK sectores) para que badblocks entregue
+# resultados muy a menudo y la reparación sea casi inmediata. Ignora CHUNK_PERCENT.
+# NOTA: badblocks acumula los sectores malos hasta acabar cada chunk, así que el
+# grano mínimo real de "inmediato" es este tamaño de chunk, no el sector individual.
+REPAIR_NOW=0
+REPAIR_NOW_CHUNK=4096                # ~2 MB con sectores de 512B: badblocks va fluido y repara seguido
 
 # Timeout configurable (-t <seg>). Es el tope DURO del kernel para el disco.
 # El timeout de cada operación del script se deriva como (IO_TIMEOUT - 2),
@@ -193,6 +201,43 @@ check_utils() {
     fi
 }
 
+show_help() {
+    cat <<EOF
+DISK HEALER v7.2 - Reparación segura de sectores defectuosos
+
+Uso: $0 [opciones] <device>
+
+  <device>                 Dispositivo de bloque a procesar (ej. /dev/sdb).
+                           ¡Debe estar DESMONTADO!
+
+Opciones:
+  -t, --timeout <seg>      Timeout de I/O en segundos (def. 10). Fija el tope
+                           del kernel; el timeout de cada operación del script
+                           se deriva como (valor - 2). Mín. 3.
+
+  -r, --repair-now         Repara los sectores defectuosos NADA MÁS encontrarlos,
+                           sin esperar a completar un porcentaje del escaneo.
+                           Usa chunks mínimos (${REPAIR_NOW_CHUNK} sectores), por lo que
+                           el escaneo global es más lento. Ignora --repair-every.
+
+  -e, --repair-every <pct> Porcentaje del disco que se escanea antes de cada
+                           pasada de reparación (def. ${CHUNK_PERCENT}). Acepta decimales
+                           (ej. 0.5). Sin efecto si se usa --repair-now.
+
+  -h, --help               Muestra esta ayuda y sale.
+
+Comportamiento por defecto (sin -r ni -e): escanea en chunks del ${CHUNK_PERCENT}% y
+repara al terminar cada chunk.
+
+Notas de seguridad:
+  - Aborta si el dispositivo o sus particiones están montadas.
+  - Verifica la identidad del disco (serial/WWN) antes de cada escritura
+    (protección anti-reset USB).
+  - Conserva copias de sectores con dato dudoso en ./disk_healer_rescued.
+  - Reanuda automáticamente si existe estado previo (.disk_healer_state).
+EOF
+}
+
 parse_args() {
     DISCO=""
     while [ $# -gt 0 ]; do
@@ -203,13 +248,25 @@ parse_args() {
                 [ "${1:-0}" -lt 3 ] && abort "El timeout mínimo razonable es 3 segundos."
                 IO_TIMEOUT=$1
                 ;;
+            -r|--repair-now)
+                REPAIR_NOW=1
+                ;;
+            -e|--repair-every)
+                shift
+                # acepta entero o decimal positivo (ej. 2, 0.5)
+                [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || abort "El valor de -e debe ser un porcentaje positivo (ej. 2 o 0.5)."
+                # rechazar 0 o valores >100
+                if [ "$(echo "${1} <= 0 || ${1} > 100" | bc -l 2>/dev/null)" = "1" ]; then
+                    abort "El porcentaje de -e debe estar entre 0 (excl.) y 100."
+                fi
+                CHUNK_PERCENT=$1
+                ;;
             -h|--help)
-                echo "Uso: $0 [-t <segundos>] <device>"
-                echo "  -t, --timeout   Timeout de I/O en segundos (def. 10). Kernel=valor, op. script=valor-2."
+                show_help
                 exit 0
                 ;;
             -*)
-                abort "Opción desconocida: $1"
+                abort "Opción desconocida: $1  (usa --help para ver las opciones)"
                 ;;
             *)
                 DISCO=$1
@@ -217,7 +274,7 @@ parse_args() {
         esac
         shift
     done
-    [ -n "$DISCO" ] || abort "Uso: $0 [-t <seg>] <device>  (ej. /dev/sdb)"
+    [ -n "$DISCO" ] || abort "Falta el dispositivo. Usa: $0 [opciones] <device>  (--help para ayuda)"
     [ -b "$DISCO" ] || abort "$DISCO no es un dispositivo de bloque válido."
     # Derivar timeout de operación del script (kernel = IO_TIMEOUT)
     OP_TIMEOUT=$(( IO_TIMEOUT - 2 ))
@@ -450,7 +507,7 @@ draw_screen() {
 
     printf "\033[H"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} ${W}%-25s${NC} ${GR}|${NC} ${C}%-41s${NC} ${B}|${NC}\033[K\n" "DISK HEALER v7.1" "$DISCO"
+    printf "${B}|${NC} ${W}%-25s${NC} ${GR}|${NC} ${C}%-41s${NC} ${B}|${NC}\033[K\n" "DISK HEALER v7.2" "$DISCO"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
     printf "${B}|${NC} ${G}%-9s${NC}:%-4d ${GR}|${NC} ${Y}%-6s${NC}:%-4d ${GR}|${NC} ${R}%-8s${NC}:%-4d ${GR}|${NC} ${C}%-7s${NC}:%-4d ${GR}|${NC} ${P}%-9s${NC}:%-4d ${B}|${NC}\033[K\n" \
            "$L_SAVED" "${TOTAL_SALVADOS:-0}" \
@@ -646,6 +703,13 @@ reparar_sector() {
 }
 
 # ================================ MAIN ========================================
+# --help / -h se atiende ANTES de cualquier comprobación (no requiere root ni utils)
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) show_help; exit 0 ;;
+    esac
+done
+
 clear
 check_root
 check_utils
@@ -660,6 +724,14 @@ set_kernel_timeout
 mkdir -p "$RESCUE_DIR"
 log_msg "===== INICIO sesión sobre $DISCO (sector=${SECTOR_SIZE}, total=${TOTAL_SECTORS}, timeout=${IO_TIMEOUT}s) ====="
 show_smart "INICIO"
+
+# --- Aviso del modo de reparación configurado ---
+if [ "$REPAIR_NOW" -eq 1 ]; then
+    echo -e "\n${C}Modo:${NC} reparación INMEDIATA (-r). Chunk=${REPAIR_NOW_CHUNK} sectores. Escaneo más lento."
+else
+    echo -e "\n${C}Modo:${NC} reparación por bloques. Pasada de reparación cada ${CHUNK_PERCENT}% del disco."
+fi
+echo -e "${C}Timeout:${NC} kernel=${IO_TIMEOUT}s / operación=${OP_TIMEOUT}s"
 
 # --- Detección de reanudación (antes del ENTER, para que el aviso sea visible) ---
 START_SECTOR=0
@@ -698,8 +770,14 @@ if [ -s "$PENDING_FILE" ]; then
     rm -f "$PENDING_FILE"
 fi
 
-CHUNK_SIZE=$(echo "$TOTAL_SECTORS * $CHUNK_PERCENT / 100" | bc)
-[ "$CHUNK_SIZE" -lt 2048 ] && CHUNK_SIZE=2048
+if [ "$REPAIR_NOW" -eq 1 ]; then
+    # Modo "reparar al instante": chunk mínimo para entregar resultados muy a menudo.
+    CHUNK_SIZE=$REPAIR_NOW_CHUNK
+else
+    # bc puede devolver decimales si CHUNK_PERCENT lo es; truncamos a entero con /1
+    CHUNK_SIZE=$(echo "($TOTAL_SECTORS * $CHUNK_PERCENT / 100) / 1" | bc)
+    [ "$CHUNK_SIZE" -lt 2048 ] && CHUNK_SIZE=2048
+fi
 
 clear
 CURRENT=$START_SECTOR
