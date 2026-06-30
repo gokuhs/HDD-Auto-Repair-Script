@@ -21,6 +21,18 @@ CHUNK_PERCENT=2
 TIEMPO_MAX=1.0                       # umbral (s) para considerar un sector "lento"
 BACKUP_INTERVAL=10                   # cada cuántos seg se persiste el estado en escaneo
 
+# Timeout configurable (-t <seg>). Es el tope DURO del kernel para el disco.
+# El timeout de cada operación del script se deriva como (IO_TIMEOUT - 2),
+# manteniendo la relación 8/10 que se pidió: kernel=10 -> script=8.
+IO_TIMEOUT=10                        # por defecto 10s; se puede cambiar con -t
+OP_TIMEOUT=8                         # se recalcula tras parsear -t
+
+# Detección de dispositivo (rellenadas en runtime)
+SMART_DOPT=""                        # opción -d para smartctl (sat/auto/"")
+DISK_SERIAL=""                       # serial/WWN para verificar identidad
+KERNEL_TIMEOUT_PATH=""               # /sys/block/<dev>/device/timeout
+KERNEL_TIMEOUT_ORIG=""               # valor original para restaurar al salir
+
 STATE_FILE=".disk_healer_state"
 PENDING_FILE=".disk_healer_pending"
 LOG_FILE="disk_healer_report.log"
@@ -121,15 +133,30 @@ is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 # ========================= LIMPIEZA / SALIDA ==================================
 cleanup_exit() {
     tput cnorm 2>/dev/null
+    # matar procesos hijos (badblocks, dd, hdparm en background)
+    jobs -p | xargs -r kill -TERM > /dev/null 2>&1
+    sleep 0.2
+    jobs -p | xargs -r kill -KILL > /dev/null 2>&1
     if [ -s "$TEMP_LIST" ]; then
         cat "$TEMP_LIST" >> "$PENDING_FILE" 2>/dev/null
         sort -un "$PENDING_FILE" -o "$PENDING_FILE" 2>/dev/null
     fi
-    jobs -p | xargs -r kill > /dev/null 2>&1
     rm -f "$BIN_DD" "$BIN_HDP" "$BIN_VOTE" "$BIN_VERIFY" "$TEMP_LIST" 2>/dev/null
+    restore_kernel_timeout
     echo -e "\n${NC}"
 }
-trap cleanup_exit SIGINT SIGTERM EXIT
+
+# SIGINT (Ctrl+C): avisar, limpiar y salir con código estándar 130.
+on_sigint() {
+    ABORT_REQUESTED=1
+    echo -e "\n${Y}Interrupción solicitada (Ctrl+C). Cerrando de forma segura...${NC}" >&2
+    cleanup_exit
+    trap - EXIT
+    exit 130
+}
+ABORT_REQUESTED=0
+trap on_sigint SIGINT
+trap cleanup_exit SIGTERM EXIT
 
 abort() {
     tput cnorm 2>/dev/null
@@ -166,10 +193,35 @@ check_utils() {
     fi
 }
 
-check_device() {
-    DISCO=${1:-}
-    [ -n "$DISCO" ] || abort "Uso: $0 <device>  (ej. /dev/sdb)"
+parse_args() {
+    DISCO=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -t|--timeout)
+                shift
+                is_uint "${1:-}" || abort "El valor de -t debe ser un entero en segundos."
+                [ "${1:-0}" -lt 3 ] && abort "El timeout mínimo razonable es 3 segundos."
+                IO_TIMEOUT=$1
+                ;;
+            -h|--help)
+                echo "Uso: $0 [-t <segundos>] <device>"
+                echo "  -t, --timeout   Timeout de I/O en segundos (def. 10). Kernel=valor, op. script=valor-2."
+                exit 0
+                ;;
+            -*)
+                abort "Opción desconocida: $1"
+                ;;
+            *)
+                DISCO=$1
+                ;;
+        esac
+        shift
+    done
+    [ -n "$DISCO" ] || abort "Uso: $0 [-t <seg>] <device>  (ej. /dev/sdb)"
     [ -b "$DISCO" ] || abort "$DISCO no es un dispositivo de bloque válido."
+    # Derivar timeout de operación del script (kernel = IO_TIMEOUT)
+    OP_TIMEOUT=$(( IO_TIMEOUT - 2 ))
+    [ "$OP_TIMEOUT" -lt 1 ] && OP_TIMEOUT=1
 }
 
 check_not_mounted() {
@@ -198,16 +250,102 @@ detect_sector_size() {
     fi
 }
 
+# Detecta qué opción -d necesita smartctl. Recorre desde "sin opción" (SATA
+# directo a placa) hasta los modos de las cajas USB más comunes. Usa también
+# la pista de `smartctl --scan` si está disponible.
+detect_smart_mode() {
+    local opt scan_hint
+    # Pista de --scan: puede sugerir directamente el -d adecuado para este disco
+    scan_hint=$(smartctl --scan 2>/dev/null | awk -v d="$DISCO" '$1==d {for(i=1;i<=NF;i++) if($i=="-d"){print $(i+1); exit}}')
+
+    # Lista de candidatos en orden razonable. El primero que devuelva atributos gana.
+    local candidates=(
+        ""                       # SATA/NVMe directo en placa
+        "sat"                    # caja USB->SATA estándar (SCSI/ATA Translation)
+        "sat,12"                 # variante con comandos de 12 bytes
+        "sat,16"                 # variante con comandos de 16 bytes
+        "usbjmicron"             # cajas JMicron
+        "usbjmicron,x"           # JMicron variante
+        "usbsunplus"             # cajas Sunplus
+        "usbcypress"             # cajas Cypress
+        "usbprolific"            # cajas Prolific
+        "scsi"                   # acceso SCSI puro
+        "auto"                   # último recurso: autodetección de smartctl
+    )
+    # Si --scan sugirió algo, probarlo primero
+    [ -n "$scan_hint" ] && candidates=("$scan_hint" "${candidates[@]}")
+
+    for opt in "${candidates[@]}"; do
+        local dflag=()
+        [ -n "$opt" ] && dflag=(-d "$opt")
+        if smartctl -A "${dflag[@]}" "$DISCO" 2>/dev/null | grep -qiE 'Reallocated_Sector|Current_Pending'; then
+            SMART_DOPT="${dflag[*]}"
+            echo -e "${C}SMART accesible${NC} con: ${SMART_DOPT:-(sin -d / acceso directo)}"
+            return 0
+        fi
+    done
+    SMART_DOPT=""
+    echo -e "${Y}AVISO:${NC} no se pudo leer SMART con ningún modo conocido. Se continúa sin métricas SMART."
+    return 1
+}
+
+# Captura el serial/WWN del disco para verificar su identidad antes de escribir.
+detect_disk_identity() {
+    DISK_SERIAL=$(lsblk -dno SERIAL "$DISCO" 2>/dev/null | head -1)
+    [ -z "$DISK_SERIAL" ] && DISK_SERIAL=$(lsblk -dno WWN "$DISCO" 2>/dev/null | head -1)
+    if [ -z "$DISK_SERIAL" ]; then
+        echo -e "${Y}AVISO:${NC} no se pudo obtener serial/WWN. La verificación anti-reset USB quedará deshabilitada."
+    else
+        echo -e "${C}Identidad del disco:${NC} serial/WWN = $DISK_SERIAL"
+    fi
+}
+
+# Comprueba que $DISCO sigue siendo EL MISMO disco (USB puede resetear y cambiar
+# de letra). Devuelve 0 si coincide o si no hay serial de referencia.
+verify_disk_identity() {
+    [ -z "$DISK_SERIAL" ] && return 0
+    [ -b "$DISCO" ] || return 1
+    local now
+    now=$(lsblk -dno SERIAL "$DISCO" 2>/dev/null | head -1)
+    [ -z "$now" ] && now=$(lsblk -dno WWN "$DISCO" 2>/dev/null | head -1)
+    [ "$now" == "$DISK_SERIAL" ]
+}
+
+# Baja el timeout del kernel para el disco y guarda el valor original.
+set_kernel_timeout() {
+    local base
+    base=$(basename "$DISCO")
+    # resolver a disco base si nos pasaron una partición (sdl1 -> sdl)
+    base=$(lsblk -dno PKNAME "$DISCO" 2>/dev/null || echo "$base")
+    [ -z "$base" ] && base=$(basename "$DISCO")
+    KERNEL_TIMEOUT_PATH="/sys/block/$base/device/timeout"
+    if [ -w "$KERNEL_TIMEOUT_PATH" ]; then
+        KERNEL_TIMEOUT_ORIG=$(cat "$KERNEL_TIMEOUT_PATH" 2>/dev/null)
+        echo "$IO_TIMEOUT" > "$KERNEL_TIMEOUT_PATH" 2>/dev/null \
+            && echo -e "${C}Timeout kernel:${NC} $KERNEL_TIMEOUT_PATH = ${IO_TIMEOUT}s (original: ${KERNEL_TIMEOUT_ORIG}s)" \
+            || echo -e "${Y}AVISO:${NC} no se pudo escribir el timeout del kernel."
+    else
+        echo -e "${Y}AVISO:${NC} $KERNEL_TIMEOUT_PATH no escribible. Solo se aplicarán timeouts del script."
+        KERNEL_TIMEOUT_PATH=""
+    fi
+}
+
+restore_kernel_timeout() {
+    if [ -n "$KERNEL_TIMEOUT_PATH" ] && [ -n "$KERNEL_TIMEOUT_ORIG" ] && [ -w "$KERNEL_TIMEOUT_PATH" ]; then
+        echo "$KERNEL_TIMEOUT_ORIG" > "$KERNEL_TIMEOUT_PATH" 2>/dev/null
+    fi
+}
+
 read_sector_dd() {
     local sector=$1 out=$2
-    dd if="$DISCO" of="$out" bs="$SECTOR_SIZE" skip="$sector" count=1 \
+    timeout "$OP_TIMEOUT" dd if="$DISCO" of="$out" bs="$SECTOR_SIZE" skip="$sector" count=1 \
        iflag=direct status=none 2>/dev/null
 }
 
 read_sector_hdparm() {
     local sector=$1 out=$2
     local raw st
-    raw=$(hdparm --read-sector "$sector" "$DISCO" 2>&1)
+    raw=$(timeout "$OP_TIMEOUT" hdparm --read-sector "$sector" "$DISCO" 2>&1)
     st=$?
     if [ $st -ne 0 ]; then
         : > "$out"
@@ -251,7 +389,7 @@ validate_unit_coherence() {
 # ================================ SMART =======================================
 smart_attr() {
     local name=$1
-    smartctl -A "$DISCO" 2>/dev/null | awk -v n="$name" '$2==n {print $NF; exit}'
+    smartctl -A $SMART_DOPT "$DISCO" 2>/dev/null | awk -v n="$name" '$2==n {print $NF; exit}'
 }
 
 show_smart() {
@@ -387,7 +525,12 @@ monitor_badblocks() {
 # =================== REPARACIÓN DE SECTOR (núcleo seguro) =====================
 write_and_verify() {
     local sector=$1 src=$2
-    dd if="$src" of="$DISCO" bs="$SECTOR_SIZE" seek="$sector" count=1 \
+    # Salvaguarda anti-reset USB: nunca escribir si el disco cambió de identidad.
+    if ! verify_disk_identity; then
+        log_msg "ABORTO ESCRITURA sector $sector: el disco no coincide con la identidad inicial ($DISK_SERIAL). Posible reset USB."
+        return 4
+    fi
+    timeout "$OP_TIMEOUT" dd if="$src" of="$DISCO" bs="$SECTOR_SIZE" seek="$sector" count=1 \
        conv=fdatasync,notrunc oflag=direct status=none 2>/dev/null
     local wst=$?
     [ $wst -ne 0 ] && return 2
@@ -398,7 +541,11 @@ write_and_verify() {
 
 zero_sector() {
     local sector=$1
-    dd if=/dev/zero of="$DISCO" bs="$SECTOR_SIZE" seek="$sector" count=1 \
+    if ! verify_disk_identity; then
+        log_msg "ABORTO ESCRITURA (ceros) sector $sector: el disco no coincide con la identidad inicial. Posible reset USB."
+        return 4
+    fi
+    timeout "$OP_TIMEOUT" dd if=/dev/zero of="$DISCO" bs="$SECTOR_SIZE" seek="$sector" count=1 \
        conv=fdatasync,notrunc oflag=direct status=none 2>/dev/null
     read_sector_dd "$sector" "$BIN_VERIFY"
 }
@@ -460,11 +607,14 @@ reparar_sector() {
     if [ -n "$good_buf" ]; then
         if [ "$es_lento" -eq 1 ] || [ "$dudoso" -eq 1 ]; then
             update_card 2 1 0 "${Y}Reescribiendo dato (refresco/remapeo)...${NC}"
-            if write_and_verify "$sector" "$good_buf"; then
+            write_and_verify "$sector" "$good_buf"; local wrc=$?
+            if [ $wrc -eq 0 ]; then
                 ((TOTAL_SALVADOS++))
                 local extra=""; [ "$dudoso" -eq 1 ] && extra=" (DUDOSO)"
                 log_msg "Sector $sector: SALVADO por reescritura directa (lento=${dur}s)$extra"
                 update_card 2 2 1 "${G}Dato reescrito y verificado.${NC}"
+            elif [ $wrc -eq 4 ]; then
+                abort "El disco cambió de identidad (posible reset USB). Abortado antes de escribir en el dispositivo equivocado."
             else
                 mkdir -p "$RESCUE_DIR"
                 cp -f "$good_buf" "$RESCUE_DIR/sector_${sector}_FAILED_VERIFY.bin"
@@ -477,10 +627,13 @@ reparar_sector() {
         fi
     else
         update_card 2 0 0 "${Y}Sector ilegible. Escribiendo ceros (remapeo)...${NC}"
-        if zero_sector "$sector"; then
+        zero_sector "$sector"; local zrc=$?
+        if [ $zrc -eq 0 ]; then
             ((TOTAL_CEROS++))
             log_msg "Sector $sector: ilegible -> ceros escritos, sector ahora legible (remapeado/curado)."
             update_card 2 0 1 "${Y}Remapeado (ceros). Dato original perdido.${NC}"
+        elif [ $zrc -eq 4 ]; then
+            abort "El disco cambió de identidad (posible reset USB). Abortado antes de escribir en el dispositivo equivocado."
         else
             ((TOTAL_FALLIDOS++))
             log_msg "Sector $sector: FALLO FÍSICO PERMANENTE (ni tras ceros es legible)."
@@ -496,17 +649,21 @@ reparar_sector() {
 clear
 check_root
 check_utils
-check_device "${1:-}"
+parse_args "$@"
 check_not_mounted
 detect_sector_size
 validate_unit_coherence
+detect_smart_mode
+detect_disk_identity
+set_kernel_timeout
 
 mkdir -p "$RESCUE_DIR"
-log_msg "===== INICIO sesión sobre $DISCO (sector=${SECTOR_SIZE}, total=${TOTAL_SECTORS}) ====="
+log_msg "===== INICIO sesión sobre $DISCO (sector=${SECTOR_SIZE}, total=${TOTAL_SECTORS}, timeout=${IO_TIMEOUT}s) ====="
 show_smart "INICIO"
 
 echo -e "\n${Y}Pulsa ENTER para comenzar el escaneo (Ctrl+C para abortar).${NC}"
-read -r _
+# El '|| exit 130' garantiza que un Ctrl+C durante la espera salga limpio
+read -r _ || exit 130
 
 tput civis 2>/dev/null
 
