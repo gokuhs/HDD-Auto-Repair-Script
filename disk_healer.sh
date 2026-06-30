@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  💾 DISK HEALER v6.2 - ROBUST UI FIX
+#  ?? DISK HEALER v6.2 - ROBUST UI FIX
 #  Corrección: Error printf, variables vacías y limpieza visual (anti-ghosting)
 # ==============================================================================
 
@@ -85,15 +85,13 @@ format_seconds() {
 get_pending_count() {
     local c1=0
     local c2=0
-    # Aseguramos que grep devuelva 0 si falla o no encuentra nada
-    if [ -f "$TEMP_LIST" ]; then 
-        c1=$(grep -cve '^\s*$' "$TEMP_LIST" 2>/dev/null || echo 0)
+    if [ -f "$TEMP_LIST" ]; then
+        c1=$(grep -cve '^\s*$' "$TEMP_LIST" 2>/dev/null)
     fi
-    if [ -f "$PENDING_FILE" ]; then 
-        c2=$(grep -cve '^\s*$' "$PENDING_FILE" 2>/dev/null || echo 0)
+    if [ -f "$PENDING_FILE" ]; then
+        c2=$(grep -cve '^\s*$' "$PENDING_FILE" 2>/dev/null)
     fi
-    # Aritmética segura
-    echo $((c1 + c2))
+    echo $(( ${c1:-0} + ${c2:-0} ))
 }
 
 cleanup_exit() {
