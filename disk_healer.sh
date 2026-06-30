@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  DISK HEALER v7.2 - SAFE REPAIR EDITION
+#  DISK HEALER v7.2.1 - SAFE REPAIR EDITION
 #  Reescritura centrada en evitar pérdida de datos:
 #   - Lectura cruzada (dd + hdparm) con decisión por status y desempate por voto
 #   - Restauración directa de la copia en sectores lentos (sin ceros intermedios)
@@ -21,13 +21,13 @@ CHUNK_PERCENT=2                      # % del disco por chunk de escaneo (def. 2)
 TIEMPO_MAX=1.0                       # umbral (s) para considerar un sector "lento"
 BACKUP_INTERVAL=10                   # cada cuántos seg se persiste el estado en escaneo
 
-# Modo "reparar nada más encontrarlos" (-r). Cuando está activo, el chunk se
-# fija al mínimo razonable (REPAIR_NOW_CHUNK sectores) para que badblocks entregue
-# resultados muy a menudo y la reparación sea casi inmediata. Ignora CHUNK_PERCENT.
-# NOTA: badblocks acumula los sectores malos hasta acabar cada chunk, así que el
-# grano mínimo real de "inmediato" es este tamaño de chunk, no el sector individual.
+# Modo "reparar nada más encontrarlos" (-r). Usa un motor de escaneo híbrido
+# propio (scan_hybrid), NO badblocks: lee en bloques grandes en zona sana y, al
+# detectar un fallo, baja a granularidad de sector reparando cada uno al instante.
+# Ignora CHUNK_PERCENT.
 REPAIR_NOW=0
-REPAIR_NOW_CHUNK=4096                # ~2 MB con sectores de 512B: badblocks va fluido y repara seguido
+HYBRID_BLOCK_BYTES=$((8 * 1024 * 1024))   # tamaño del bloque de lectura rápida en -r (def. 8 MB). -b lo cambia.
+REPAIR_NEIGHBORS=8                   # tras reparar, reintentar ±N sectores por si se destrabaron
 
 # Timeout configurable (-t <seg>). Es el tope DURO del kernel para el disco.
 # El timeout de cada operación del script se deriva como (IO_TIMEOUT - 2),
@@ -70,6 +70,7 @@ TOTAL_DUDOSOS=0
 SECTOR_ACTUAL=0
 SECTOR_SIZE=512
 TOTAL_SECTORS=0
+LAST_REPAIR_DONE=0
 
 # --- IDIOMA ---
 detect_language() {
@@ -203,7 +204,7 @@ check_utils() {
 
 show_help() {
     cat <<EOF
-DISK HEALER v7.2 - Reparación segura de sectores defectuosos
+DISK HEALER v7.2.1 - Reparación segura de sectores defectuosos
 
 Uso: $0 [opciones] <device>
 
@@ -215,10 +216,15 @@ Opciones:
                            del kernel; el timeout de cada operación del script
                            se deriva como (valor - 2). Mín. 3.
 
-  -r, --repair-now         Repara los sectores defectuosos NADA MÁS encontrarlos,
-                           sin esperar a completar un porcentaje del escaneo.
-                           Usa chunks mínimos (${REPAIR_NOW_CHUNK} sectores), por lo que
-                           el escaneo global es más lento. Ignora --repair-every.
+  -r, --repair-now         Repara los sectores defectuosos NADA MÁS encontrarlos.
+                           Usa un motor híbrido propio (no badblocks): lee en
+                           bloques grandes en zona sana y, al detectar un fallo,
+                           baja a granularidad de sector y repara cada uno al
+                           instante. Ignora --repair-every.
+
+  -b, --block <MB>         Tamaño del bloque de lectura rápida en modo -r (def. 8).
+                           Mayor = más rápido en zona sana; menor = re-escanea
+                           menos al encontrar un fallo. Sin efecto sin -r.
 
   -e, --repair-every <pct> Porcentaje del disco que se escanea antes de cada
                            pasada de reparación (def. ${CHUNK_PERCENT}). Acepta decimales
@@ -250,6 +256,12 @@ parse_args() {
                 ;;
             -r|--repair-now)
                 REPAIR_NOW=1
+                ;;
+            -b|--block)
+                shift
+                is_uint "${1:-}" || abort "El valor de -b debe ser un entero en MB."
+                [ "${1:-0}" -lt 1 ] && abort "El bloque mínimo es 1 MB."
+                HYBRID_BLOCK_BYTES=$(( $1 * 1024 * 1024 ))
                 ;;
             -e|--repair-every)
                 shift
@@ -507,7 +519,7 @@ draw_screen() {
 
     printf "\033[H"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} ${W}%-25s${NC} ${GR}|${NC} ${C}%-41s${NC} ${B}|${NC}\033[K\n" "DISK HEALER v7.2" "$DISCO"
+    printf "${B}|${NC} ${W}%-25s${NC} ${GR}|${NC} ${C}%-41s${NC} ${B}|${NC}\033[K\n" "DISK HEALER v7.2.1" "$DISCO"
     echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
     printf "${B}|${NC} ${G}%-9s${NC}:%-4d ${GR}|${NC} ${Y}%-6s${NC}:%-4d ${GR}|${NC} ${R}%-8s${NC}:%-4d ${GR}|${NC} ${C}%-7s${NC}:%-4d ${GR}|${NC} ${P}%-9s${NC}:%-4d ${B}|${NC}\033[K\n" \
            "$L_SAVED" "${TOTAL_SALVADOS:-0}" \
@@ -610,6 +622,7 @@ zero_sector() {
 reparar_sector() {
     local sector=$1
     write_state "$sector"
+    LAST_REPAIR_DONE=0   # 1 si hubo cualquier intervención de escritura sobre el sector
 
     update_card() { draw_screen "REPAIR" "$sector" "$TOTAL_SECTORS" "!" "Interviniendo..." "$sector" "$1" "$2" "$3" "$4"; }
     update_card 0 0 0 "Leyendo (dd + hdparm)..."
@@ -665,6 +678,7 @@ reparar_sector() {
         if [ "$es_lento" -eq 1 ] || [ "$dudoso" -eq 1 ]; then
             update_card 2 1 0 "${Y}Reescribiendo dato (refresco/remapeo)...${NC}"
             write_and_verify "$sector" "$good_buf"; local wrc=$?
+            LAST_REPAIR_DONE=1
             if [ $wrc -eq 0 ]; then
                 ((TOTAL_SALVADOS++))
                 local extra=""; [ "$dudoso" -eq 1 ] && extra=" (DUDOSO)"
@@ -685,6 +699,7 @@ reparar_sector() {
     else
         update_card 2 0 0 "${Y}Sector ilegible. Escribiendo ceros (remapeo)...${NC}"
         zero_sector "$sector"; local zrc=$?
+        LAST_REPAIR_DONE=1
         if [ $zrc -eq 0 ]; then
             ((TOTAL_CEROS++))
             log_msg "Sector $sector: ilegible -> ceros escritos, sector ahora legible (remapeado/curado)."
@@ -700,6 +715,72 @@ reparar_sector() {
 
     rm -f "$BIN_DD" "$BIN_HDP" "$BIN_VOTE" "$BIN_VERIFY" 2>/dev/null
     sleep 0.4
+}
+
+# Tras reparar un sector, reintenta su entorno (±REPAIR_NEIGHBORS) por si el
+# remapeo del firmware "destrabó" sectores vecinos. Repara los que sigan fallando.
+declare -A PROCESSED_SECTORS
+repair_neighbors() {
+    local center=$1
+    local lo=$(( center - REPAIR_NEIGHBORS ))
+    local hi=$(( center + REPAIR_NEIGHBORS ))
+    [ $lo -lt 0 ] && lo=0
+    [ $hi -ge "$TOTAL_SECTORS" ] && hi=$(( TOTAL_SECTORS - 1 ))
+    local s
+    for (( s=lo; s<=hi; s++ )); do
+        [ "$s" -eq "$center" ] && continue
+        [ -n "${PROCESSED_SECTORS[$s]:-}" ] && continue
+        if read_sector_dd "$s" "$BIN_VERIFY"; then
+            continue   # vecino se lee bien, no se toca
+        fi
+        PROCESSED_SECTORS[$s]=1
+        reparar_sector "$s"
+    done
+}
+
+# Motor de escaneo HÍBRIDO para el modo -r:
+#  - lee en bloques grandes (HYBRID_BLOCK_BYTES) -> rápido en zona sana
+#  - si un bloque falla, baja a granularidad de sector y repara CADA sector malo
+#    en el instante en que lo detecta, reintentando el entorno tras cada reparación.
+scan_hybrid() {
+    local start=$1
+    local block_sectors=$(( HYBRID_BLOCK_BYTES / SECTOR_SIZE ))
+    [ "$block_sectors" -lt 1 ] && block_sectors=1
+    local spin='-\|/' i=0 last_write_time=0
+    local cur=$start
+
+    while [ "$cur" -lt "$TOTAL_SECTORS" ]; do
+        local remaining=$(( TOTAL_SECTORS - cur ))
+        local this_block=$block_sectors
+        [ "$this_block" -gt "$remaining" ] && this_block=$remaining
+
+        i=$(( (i+1) % 4 ))
+        local now; now=$(date +%s)
+        if (( now - last_write_time >= BACKUP_INTERVAL )); then
+            write_state "$cur"
+            last_write_time=$now
+        fi
+        draw_screen "SCAN" "$cur" "$TOTAL_SECTORS" "${spin:$i:1}" "Lectura rápida por bloques (-r)..."
+
+        # Lectura rápida del bloque entero (a /dev/null, solo para verificar).
+        if timeout "$OP_TIMEOUT" dd if="$DISCO" of=/dev/null bs="$SECTOR_SIZE" \
+               skip="$cur" count="$this_block" iflag=direct status=none 2>/dev/null; then
+            cur=$(( cur + this_block ))            # bloque sano -> avanzar
+        else
+            # Bloque con fallo -> descender a sector y reparar al instante
+            draw_screen "SCAN" "$cur" "$TOTAL_SECTORS" "!" "${Y}Fallo en bloque: descendiendo a sector...${NC}"
+            local s end=$(( cur + this_block ))
+            for (( s=cur; s<end; s++ )); do
+                [ -n "${PROCESSED_SECTORS[$s]:-}" ] && continue
+                if ! read_sector_dd "$s" "$BIN_VERIFY"; then
+                    PROCESSED_SECTORS[$s]=1
+                    reparar_sector "$s"
+                    [ "$LAST_REPAIR_DONE" -eq 1 ] && repair_neighbors "$s"
+                fi
+            done
+            cur=$end
+        fi
+    done
 }
 
 # ================================ MAIN ========================================
@@ -727,7 +808,7 @@ show_smart "INICIO"
 
 # --- Aviso del modo de reparación configurado ---
 if [ "$REPAIR_NOW" -eq 1 ]; then
-    echo -e "\n${C}Modo:${NC} reparación INMEDIATA (-r). Chunk=${REPAIR_NOW_CHUNK} sectores. Escaneo más lento."
+    echo -e "\n${C}Modo:${NC} reparación INMEDIATA (-r), motor híbrido. Bloque=$(( HYBRID_BLOCK_BYTES / 1024 / 1024 )) MB. Repara cada sector al detectarlo."
 else
     echo -e "\n${C}Modo:${NC} reparación por bloques. Pasada de reparación cada ${CHUNK_PERCENT}% del disco."
 fi
@@ -770,39 +851,39 @@ if [ -s "$PENDING_FILE" ]; then
     rm -f "$PENDING_FILE"
 fi
 
+clear
 if [ "$REPAIR_NOW" -eq 1 ]; then
-    # Modo "reparar al instante": chunk mínimo para entregar resultados muy a menudo.
-    CHUNK_SIZE=$REPAIR_NOW_CHUNK
+    # --- MODO -r: motor híbrido propio (repara cada sector al detectarlo) ---
+    scan_hybrid "$START_SECTOR"
 else
-    # bc puede devolver decimales si CHUNK_PERCENT lo es; truncamos a entero con /1
+    # --- MODO normal: badblocks por chunks ---
     CHUNK_SIZE=$(echo "($TOTAL_SECTORS * $CHUNK_PERCENT / 100) / 1" | bc)
     [ "$CHUNK_SIZE" -lt 2048 ] && CHUNK_SIZE=2048
+
+    CURRENT=$START_SECTOR
+    while [ "$CURRENT" -lt "$TOTAL_SECTORS" ]; do
+        END=$((CURRENT + CHUNK_SIZE))
+        [ "$END" -gt "$TOTAL_SECTORS" ] && END=$TOTAL_SECTORS
+
+        # badblocks SOLO LECTURA (-s). NUNCA usar -w (destructivo).
+        badblocks -b "$SECTOR_SIZE" -s "$DISCO" "$END" "$CURRENT" > "$TEMP_LIST" 2>/dev/null &
+        PID_BB=$!
+        monitor_badblocks "$PID_BB" "$TOTAL_SECTORS"
+
+        if [ -s "$TEMP_LIST" ]; then
+            cp "$TEMP_LIST" .current_chunk_list
+            while IFS= read -r bad_sector; do
+                is_uint "$bad_sector" && reparar_sector "$bad_sector"
+                sed -i "/^${bad_sector}$/d" "$TEMP_LIST"
+            done < .current_chunk_list
+            rm -f .current_chunk_list
+            : > "$TEMP_LIST"
+        fi
+
+        CURRENT=$END
+        write_state "$CURRENT"
+    done
 fi
-
-clear
-CURRENT=$START_SECTOR
-while [ "$CURRENT" -lt "$TOTAL_SECTORS" ]; do
-    END=$((CURRENT + CHUNK_SIZE))
-    [ "$END" -gt "$TOTAL_SECTORS" ] && END=$TOTAL_SECTORS
-
-    # badblocks SOLO LECTURA (-s). NUNCA usar -w (destructivo).
-    badblocks -b "$SECTOR_SIZE" -s "$DISCO" "$END" "$CURRENT" > "$TEMP_LIST" 2>/dev/null &
-    PID_BB=$!
-    monitor_badblocks "$PID_BB" "$TOTAL_SECTORS"
-
-    if [ -s "$TEMP_LIST" ]; then
-        cp "$TEMP_LIST" .current_chunk_list
-        while IFS= read -r bad_sector; do
-            is_uint "$bad_sector" && reparar_sector "$bad_sector"
-            sed -i "/^${bad_sector}$/d" "$TEMP_LIST"
-        done < .current_chunk_list
-        rm -f .current_chunk_list
-        : > "$TEMP_LIST"
-    fi
-
-    CURRENT=$END
-    write_state "$CURRENT"
-done
 
 clear
 draw_screen "SCAN" "$TOTAL_SECTORS" "$TOTAL_SECTORS" "OK" "PROCESO FINALIZADO" 0 0 0 0 ""
