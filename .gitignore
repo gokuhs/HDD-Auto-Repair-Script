@@ -2,4 +2,5 @@
 *.log
 .disk_healer_state
 *.bin
+disk_healer_rescued
 /tmp/*
