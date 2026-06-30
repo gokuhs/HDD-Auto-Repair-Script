@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  DISK HEALER v7.2.1 - SAFE REPAIR EDITION
+#  DISK HEALER v7.2.2 - SAFE REPAIR EDITION
 #  Reescritura centrada en evitar pérdida de datos:
 #   - Lectura cruzada (dd + hdparm) con decisión por status y desempate por voto
 #   - Restauración directa de la copia en sectores lentos (sin ceros intermedios)
@@ -76,14 +76,16 @@ LAST_REPAIR_DONE=0
 detect_language() {
     if [[ "${LANG:-}" == *"es_"* ]]; then
         L_SAVED="Salvados"; L_ZEROS="Ceros"; L_FAIL="Fallidos"; L_PEND="Pendientes"
-        L_DUB="Dudosos"; L_SPEED="Velocidad"; L_ETA="T. Restante"; L_FINISH="Fin Estimado"
+        L_DUB="Dudosos"; L_SPEED="Velocidad"; L_ETA="T. Restante"; L_FINISH="Fin Est."
         L_SCAN="ESCANEANDO"; L_REPAIR="REPARANDO"; L_PLUS_REPAIR="(+ Reparacion)"
         L_PH_READ="Lectura"; L_PH_RESC="Rescate"; L_PH_ZERO="Ceros"
+        L_ELAPSED="Transcurr."; L_MODE="Modo"; L_TOUT="Timeout"
     else
         L_SAVED="Saved"; L_ZEROS="Zeros"; L_FAIL="Failed"; L_PEND="Pending"
-        L_DUB="Dubious"; L_SPEED="Speed"; L_ETA="ETA"; L_FINISH="Est. Finish"
+        L_DUB="Dubious"; L_SPEED="Speed"; L_ETA="ETA"; L_FINISH="Est.End"
         L_SCAN="SCANNING"; L_REPAIR="REPAIRING"; L_PLUS_REPAIR="(+ Repair)"
         L_PH_READ="Read"; L_PH_RESC="Rescue"; L_PH_ZERO="Zeros"
+        L_ELAPSED="Elapsed"; L_MODE="Mode"; L_TOUT="Timeout"
     fi
 }
 detect_language
@@ -102,6 +104,34 @@ format_seconds() {
 fmt_int() {
     local n=${1:-0}
     echo "$n" | sed -r ':a;s/([0-9])([0-9]{3})($|[^0-9])/\1.\2\3/;ta'
+}
+
+# Formatea la hora de fin estimada indicando el día sin ambigüedad:
+#   hoy       -> "14:30"
+#   mañana    -> "Mañana 14:30"
+#   +2 o más  -> "Jue 03/07 14:30"
+format_finish() {
+    local eta_seconds=${1:-0}
+    local finish_epoch today_epoch finish_day today_day diff
+    finish_epoch=$(date -d "+$eta_seconds seconds" +%s 2>/dev/null) || { echo "--:--"; return; }
+    today_epoch=$(date +%s)
+    # día (a medianoche) para comparar saltos de fecha, no de 24h
+    finish_day=$(date -d "@$finish_epoch" +%Y%m%d 2>/dev/null)
+    today_day=$(date +%Y%m%d)
+    # diferencia en días naturales
+    local fd td
+    fd=$(date -d "$finish_day" +%s 2>/dev/null)
+    td=$(date -d "$today_day" +%s 2>/dev/null)
+    diff=$(( (fd - td) / 86400 ))
+    local hhmm; hhmm=$(date -d "@$finish_epoch" +%H:%M 2>/dev/null)
+    if [ "$diff" -le 0 ]; then
+        echo "$hhmm"
+    elif [ "$diff" -eq 1 ]; then
+        if [[ "${LANG:-}" == *"es_"* ]]; then echo "Manana $hhmm"; else echo "Tomorrow $hhmm"; fi
+    else
+        # fecha completa con día de semana abreviado (LC_TIME forzado a C para ancho fijo ASCII)
+        echo "$(LC_TIME=C date -d "@$finish_epoch" '+%a %d/%m %H:%M' 2>/dev/null)"
+    fi
 }
 
 get_pending_count() {
@@ -204,7 +234,7 @@ check_utils() {
 
 show_help() {
     cat <<EOF
-DISK HEALER v7.2.1 - Reparación segura de sectores defectuosos
+DISK HEALER v7.2.2 - Reparación segura de sectores defectuosos
 
 Uso: $0 [opciones] <device>
 
@@ -291,6 +321,8 @@ parse_args() {
     # Derivar timeout de operación del script (kernel = IO_TIMEOUT)
     OP_TIMEOUT=$(( IO_TIMEOUT - 2 ))
     [ "$OP_TIMEOUT" -lt 1 ] && OP_TIMEOUT=1
+    # MB del bloque híbrido (para mostrar en la UI sin recalcular cada refresco)
+    HYBRID_BLOCK_BYTES_MB=$(( HYBRID_BLOCK_BYTES / 1024 / 1024 ))
 }
 
 check_not_mounted() {
@@ -502,7 +534,7 @@ draw_screen() {
     [ -z "$percent" ] && percent="0.00"
     local pending; pending=$(get_pending_count)
 
-    local current_time elapsed sectors_done speed=0 eta_str="--:--:--" finish_str="--:--"
+    local current_time elapsed sectors_done speed=0 eta_str="--:--:--"
     current_time=$(date +%s)
     elapsed=$((current_time - SESSION_START_TIME))
     sectors_done=$((sector - SESSION_START_SECTOR))
@@ -512,50 +544,93 @@ draw_screen() {
             local remaining=$((total - sector))
             local eta_seconds=$((remaining / speed))
             eta_str=$(format_seconds $eta_seconds)
-            finish_str=$(date -d "+$eta_seconds seconds" +"%H:%M" 2>/dev/null || echo "--:--")
         fi
-        [ "$pending" -gt 0 ] && eta_str="$eta_str $L_PLUS_REPAIR"
+        # un '*' discreto indica que aún quedan reparaciones por hacer (no descuadra)
+        [ "$pending" -gt 0 ] && eta_str="${eta_str}*"
     fi
 
     printf "\033[H"
-    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} ${W}%-25s${NC} ${GR}|${NC} ${C}%-41s${NC} ${B}|${NC}\033[K\n" "DISK HEALER v7.2.1" "$DISCO"
-    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} ${G}%-9s${NC}:%-4d ${GR}|${NC} ${Y}%-6s${NC}:%-4d ${GR}|${NC} ${R}%-8s${NC}:%-4d ${GR}|${NC} ${C}%-7s${NC}:%-4d ${GR}|${NC} ${P}%-9s${NC}:%-4d ${B}|${NC}\033[K\n" \
+
+    # --- Cálculo de elapsed y fin estimado con día ---
+    local elapsed_str finish_str="--:--"
+    elapsed_str=$(format_seconds "$elapsed")
+    if [ $elapsed -gt 5 ] && [ $sectors_done -gt 0 ] && [ "$speed" -gt 0 ]; then
+        local remaining2=$((total - sector))
+        local eta_seconds2=$((remaining2 / speed))
+        finish_str=$(format_finish "$eta_seconds2")
+    fi
+
+    # --- Texto de modo activo (sin acentos; cabe en %-11s) ---
+    local mode_txt
+    if [ "${REPAIR_NOW:-0}" -eq 1 ]; then
+        mode_txt="hib ${HYBRID_BLOCK_BYTES_MB:-8}MB"
+    else
+        mode_txt="blk ${CHUNK_PERCENT}%"
+    fi
+
+    # Anchos internos: el marco mide 74 columnas visibles (igual que el original).
+    local IW=72   # ancho interior entre las barras verticales
+
+    # Helper: imprime una línea de marco con borde Unicode y contenido ya formateado
+    # a IW columnas ASCII. Los colores van fuera del cómputo de ancho.
+    # Línea superior / divisoria / inferior
+    local TL='?' TR='?' BL='?' BR='?' HZ='?' VL='?' ML='?' MR='?'
+    local HBAR; HBAR=$(printf "%0.s${HZ}" $(seq 1 $IW))
+
+    # Encabezado
+    echo -e "${B}${TL}${HBAR}${TR}${NC}\033[K"
+    printf "${B}${VL}${NC} ${W}%-22s${NC} ${GR}?${NC} ${C}%-47s${NC} ${B}${VL}${NC}\033[K\n" \
+           "DISK HEALER v7.2.2" "$DISCO"
+    echo -e "${B}${ML}${HBAR}${MR}${NC}\033[K"
+
+    # Fila de estadísticas (5 contadores)
+    printf "${B}${VL}${NC} ${G}%-8s${NC}:%-5d ${GR}?${NC} ${Y}%-6s${NC}:%-5d ${GR}?${NC} ${R}%-8s${NC}:%-4d ${GR}?${NC} ${C}%-7s${NC}:%-4d ${GR}?${NC} ${P}%-7s${NC}:%-4d ${B}${VL}${NC}\033[K\n" \
            "$L_SAVED" "${TOTAL_SALVADOS:-0}" \
            "$L_ZEROS" "${TOTAL_CEROS:-0}" \
-           "$L_FAIL" "${TOTAL_FALLIDOS:-0}" \
-           "$L_DUB" "${TOTAL_DUDOSOS:-0}" \
-           "$L_PEND" "${pending:-0}"
-    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
-    printf "${B}|${NC} %-10s:%-7s ${GR}|${NC} %-10s:%-19s ${GR}|${NC} %-10s:%-5s ${B}|${NC}\033[K\n" \
-           "$L_SPEED" "${speed} s/s" "$L_ETA" "$eta_str" "$L_FINISH" "$finish_str"
-    echo -e "${B}+------------------------------------------------------------------------+${NC}\033[K"
+           "$L_FAIL"  "${TOTAL_FALLIDOS:-0}" \
+           "$L_DUB"   "${TOTAL_DUDOSOS:-0}" \
+           "$L_PEND"  "${pending:-0}"
+    echo -e "${B}${ML}${HBAR}${MR}${NC}\033[K"
 
-    local width=50 num_filled num_empty filled="" empty=""
+    # Fila de velocidad / ETA / fin estimado
+    printf "${B}${VL}${NC} %-11s:%-9s ${GR}?${NC} %-11s:%-11s ${GR}?${NC} %-9s:%-14s ${B}${VL}${NC}\033[K\n" \
+           "$L_SPEED" "${speed} s/s" "$L_ETA" "$eta_str" "$L_FINISH" "$finish_str"
+    # Fila de elapsed / modo / timeout
+    printf "${B}${VL}${NC} %-11s:%-9s ${GR}?${NC} %-11s:%-11s ${GR}?${NC} %-9s:%-14s ${B}${VL}${NC}\033[K\n" \
+           "$L_ELAPSED" "$elapsed_str" "$L_MODE" "$mode_txt" "$L_TOUT" "${IO_TIMEOUT:-?}s"
+    echo -e "${B}${BL}${HBAR}${BR}${NC}\033[K"
+
+    # --- Barra de progreso con bloques Unicode y color según avance ---
+    local width=58 num_filled num_empty filled="" empty=""
     num_filled=$(echo "scale=0; $width * $percent / 100" | bc 2>/dev/null)
     is_uint "$num_filled" || num_filled=0
     [ "$num_filled" -gt "$width" ] && num_filled=$width
     num_empty=$((width - num_filled))
-    [ "$num_filled" -gt 0 ] && filled=$(printf '%0.s#' $(seq 1 "$num_filled"))
-    [ "$num_empty" -gt 0 ] && empty=$(printf '%0.s.' $(seq 1 "$num_empty"))
+    [ "$num_filled" -gt 0 ] && filled=$(printf "%0.s?" $(seq 1 "$num_filled"))
+    [ "$num_empty" -gt 0 ]  && empty=$(printf "%0.s?" $(seq 1 "$num_empty"))
+    # color de la barra: rojo <33, amarillo <66, verde >=66
+    local bar_col=$R
+    local pint=${percent%.*}; is_uint "$pint" || pint=0
+    [ "$pint" -ge 33 ] && bar_col=$Y
+    [ "$pint" -ge 66 ] && bar_col=$G
 
     echo ""
-    echo -e "${B}[${filled}${empty}]${NC} ${C}${percent}%${NC}\033[K"
-    echo -e "${P}[${spinner}]${NC} ${Y}$(fmt_int "$sector")${NC} / $(fmt_int "$total")\033[K"
+    echo -e "${bar_col}${filled}${GR}${empty}${NC} ${W}${percent}%${NC}\033[K"
+    echo -e "${P}[${spinner}]${NC} ${Y}$(fmt_int "$sector")${NC} / $(fmt_int "$total") ${GR}sectores${NC}\033[K"
 
     if [ "$mode" == "SCAN" ]; then
-        echo -e "${G}$L_SCAN${NC} - $status_msg\033[K"
+        echo -e "${G}${L_SCAN}${NC} ${GR}»${NC} $status_msg\033[K"
         echo -e "\033[J"
     else
-        echo -e "${R}$L_REPAIR${NC} >>> SECTOR: ${W}$r_sector${NC}\033[K"
-        local i_pend="${GR}[ ]${NC}" i_ok="${G}[OK]${NC}" i_fail="${R}[FAIL]${NC}" i_try="${Y}[?]${NC}"
+        echo -e "${R}${L_REPAIR}${NC} ${GR}»»»${NC} SECTOR: ${W}$r_sector${NC}\033[K"
+        local i_pend="${GR}[ ]${NC}" i_ok="${G}[OK]${NC}" i_fail="${R}[?]${NC}" i_try="${Y}[?]${NC}"
         local v_read=$i_pend; [ "$st_read" -eq 1 ] && v_read=$i_ok; [ "$st_read" -eq 2 ] && v_read=$i_fail
         local v_resc=$i_pend; [ "$st_resc" -eq 1 ] && v_resc=$i_try; [ "$st_resc" -eq 2 ] && v_resc=$i_ok; [ "$st_resc" -eq 3 ] && v_resc=$i_fail
         local v_patch=$i_pend; [ "$st_patch" -eq 1 ] && v_patch=$i_ok; [ "$st_patch" -eq 2 ] && v_patch=$i_fail
-        echo -e "${B}+--------------------------------------------------------+${NC}\033[K"
-        printf "${B}|${NC} %-18b %-18b %-18b ${B}|${NC}\033[K\n" "$v_read $L_PH_READ" "$v_resc $L_PH_RESC" "$v_patch $L_PH_ZERO"
-        echo -e "${B}+--------------------------------------------------------+${NC}\033[K"
+        local RHBAR; RHBAR=$(printf "%0.s${HZ}" $(seq 1 56))
+        echo -e "${B}${TL}${RHBAR}${TR}${NC}\033[K"
+        printf "${B}${VL}${NC} %-19b %-19b %-19b ${B}${VL}${NC}\033[K\n" "$v_read $L_PH_READ" "$v_resc $L_PH_RESC" "$v_patch $L_PH_ZERO"
+        echo -e "${B}${BL}${RHBAR}${BR}${NC}\033[K"
         echo -e "${W}Status:${NC} $r_msg\033[K"
         echo -e "\033[J"
     fi
