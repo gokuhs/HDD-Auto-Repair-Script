@@ -90,6 +90,27 @@ detect_language() {
 }
 detect_language
 
+# --- AUTODETECCIÓN DE CARACTERES DE CAJA (Unicode si el terminal lo soporta) ---
+# Si el locale efectivo es UTF-8, usamos caja Unicode; si no, ASCII.
+# Esto evita los '?' cuando se ejecuta como root con locale C/POSIX.
+detect_box_charset() {
+    local cmap
+    cmap=$(locale charmap 2>/dev/null)
+    if [ "$cmap" = "UTF-8" ] || [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *"UTF-8"* ]] || [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *"utf8"* ]]; then
+        USE_UNICODE=1
+        BX_TL='?'; BX_TR='?'; BX_BL='?'; BX_BR='?'; BX_HZ='?'; BX_VL='?'; BX_ML='?'; BX_MR='?'; BX_SEP='?'
+        BX_FILL='?'; BX_EMPTY='?'; BX_ARROW='»'; BX_FAIL='?'
+        # caja secundaria (tarjeta de reparación)
+        BX_TL2='?'; BX_TR2='?'; BX_BL2='?'; BX_BR2='?'; BX_HZ2='?'; BX_VL2='?'
+    else
+        USE_UNICODE=0
+        BX_TL='+'; BX_TR='+'; BX_BL='+'; BX_BR='+'; BX_HZ='='; BX_VL='|'; BX_ML='+'; BX_MR='+'; BX_SEP='|'
+        BX_FILL='#'; BX_EMPTY='.'; BX_ARROW='>>'; BX_FAIL='X'
+        BX_TL2='+'; BX_TR2='+'; BX_BL2='+'; BX_BR2='+'; BX_HZ2='-'; BX_VL2='|'
+    fi
+}
+detect_box_charset
+
 # ============================== LOGGING =======================================
 log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
@@ -551,6 +572,9 @@ draw_screen() {
 
     printf "\033[H"
 
+    # Normalizar percent para que SIEMPRE lleve cero inicial (.93 -> 0.93)
+    [[ "$percent" == .* ]] && percent="0$percent"
+
     # --- Cálculo de elapsed y fin estimado con día ---
     local elapsed_str finish_str="--:--"
     elapsed_str=$(format_seconds "$elapsed")
@@ -568,47 +592,40 @@ draw_screen() {
         mode_txt="blk ${CHUNK_PERCENT}%"
     fi
 
-    # Anchos internos: el marco mide 74 columnas visibles (igual que el original).
     local IW=72   # ancho interior entre las barras verticales
-
-    # Helper: imprime una línea de marco con borde Unicode y contenido ya formateado
-    # a IW columnas ASCII. Los colores van fuera del cómputo de ancho.
-    # Línea superior / divisoria / inferior
-    local TL='?' TR='?' BL='?' BR='?' HZ='?' VL='?' ML='?' MR='?'
-    local HBAR; HBAR=$(printf "%0.s${HZ}" $(seq 1 $IW))
+    local HBAR; HBAR=$(printf "%0.s${BX_HZ}" $(seq 1 $IW))
 
     # Encabezado
-    echo -e "${B}${TL}${HBAR}${TR}${NC}\033[K"
-    printf "${B}${VL}${NC} ${W}%-22s${NC} ${GR}?${NC} ${C}%-47s${NC} ${B}${VL}${NC}\033[K\n" \
+    echo -e "${B}${BX_TL}${HBAR}${BX_TR}${NC}\033[K"
+    printf "${B}${BX_VL}${NC} ${W}%-22s${NC} ${GR}${BX_SEP}${NC} ${C}%-47s${NC} ${B}${BX_VL}${NC}\033[K\n" \
            "DISK HEALER v7.2.2" "$DISCO"
-    echo -e "${B}${ML}${HBAR}${MR}${NC}\033[K"
+    echo -e "${B}${BX_ML}${HBAR}${BX_MR}${NC}\033[K"
 
     # Fila de estadísticas (5 contadores)
-    printf "${B}${VL}${NC} ${G}%-8s${NC}:%-5d ${GR}?${NC} ${Y}%-6s${NC}:%-5d ${GR}?${NC} ${R}%-8s${NC}:%-4d ${GR}?${NC} ${C}%-7s${NC}:%-4d ${GR}?${NC} ${P}%-7s${NC}:%-4d ${B}${VL}${NC}\033[K\n" \
+    printf "${B}${BX_VL}${NC} ${G}%-8s${NC}:%-5d ${GR}${BX_SEP}${NC} ${Y}%-6s${NC}:%-5d ${GR}${BX_SEP}${NC} ${R}%-8s${NC}:%-4d ${GR}${BX_SEP}${NC} ${C}%-7s${NC}:%-4d ${GR}${BX_SEP}${NC} ${P}%-7s${NC}:%-4d ${B}${BX_VL}${NC}\033[K\n" \
            "$L_SAVED" "${TOTAL_SALVADOS:-0}" \
            "$L_ZEROS" "${TOTAL_CEROS:-0}" \
            "$L_FAIL"  "${TOTAL_FALLIDOS:-0}" \
            "$L_DUB"   "${TOTAL_DUDOSOS:-0}" \
            "$L_PEND"  "${pending:-0}"
-    echo -e "${B}${ML}${HBAR}${MR}${NC}\033[K"
+    echo -e "${B}${BX_ML}${HBAR}${BX_MR}${NC}\033[K"
 
     # Fila de velocidad / ETA / fin estimado
-    printf "${B}${VL}${NC} %-11s:%-9s ${GR}?${NC} %-11s:%-11s ${GR}?${NC} %-9s:%-14s ${B}${VL}${NC}\033[K\n" \
+    printf "${B}${BX_VL}${NC} %-11s:%-9s ${GR}${BX_SEP}${NC} %-11s:%-11s ${GR}${BX_SEP}${NC} %-9s:%-14s ${B}${BX_VL}${NC}\033[K\n" \
            "$L_SPEED" "${speed} s/s" "$L_ETA" "$eta_str" "$L_FINISH" "$finish_str"
     # Fila de elapsed / modo / timeout
-    printf "${B}${VL}${NC} %-11s:%-9s ${GR}?${NC} %-11s:%-11s ${GR}?${NC} %-9s:%-14s ${B}${VL}${NC}\033[K\n" \
+    printf "${B}${BX_VL}${NC} %-11s:%-9s ${GR}${BX_SEP}${NC} %-11s:%-11s ${GR}${BX_SEP}${NC} %-9s:%-14s ${B}${BX_VL}${NC}\033[K\n" \
            "$L_ELAPSED" "$elapsed_str" "$L_MODE" "$mode_txt" "$L_TOUT" "${IO_TIMEOUT:-?}s"
-    echo -e "${B}${BL}${HBAR}${BR}${NC}\033[K"
+    echo -e "${B}${BX_BL}${HBAR}${BX_BR}${NC}\033[K"
 
-    # --- Barra de progreso con bloques Unicode y color según avance ---
+    # --- Barra de progreso con color según avance ---
     local width=58 num_filled num_empty filled="" empty=""
     num_filled=$(echo "scale=0; $width * $percent / 100" | bc 2>/dev/null)
     is_uint "$num_filled" || num_filled=0
     [ "$num_filled" -gt "$width" ] && num_filled=$width
     num_empty=$((width - num_filled))
-    [ "$num_filled" -gt 0 ] && filled=$(printf "%0.s?" $(seq 1 "$num_filled"))
-    [ "$num_empty" -gt 0 ]  && empty=$(printf "%0.s?" $(seq 1 "$num_empty"))
-    # color de la barra: rojo <33, amarillo <66, verde >=66
+    [ "$num_filled" -gt 0 ] && filled=$(printf "%0.s${BX_FILL}" $(seq 1 "$num_filled"))
+    [ "$num_empty" -gt 0 ]  && empty=$(printf "%0.s${BX_EMPTY}" $(seq 1 "$num_empty"))
     local bar_col=$R
     local pint=${percent%.*}; is_uint "$pint" || pint=0
     [ "$pint" -ge 33 ] && bar_col=$Y
@@ -619,18 +636,18 @@ draw_screen() {
     echo -e "${P}[${spinner}]${NC} ${Y}$(fmt_int "$sector")${NC} / $(fmt_int "$total") ${GR}sectores${NC}\033[K"
 
     if [ "$mode" == "SCAN" ]; then
-        echo -e "${G}${L_SCAN}${NC} ${GR}»${NC} $status_msg\033[K"
+        echo -e "${G}${L_SCAN}${NC} ${GR}${BX_ARROW}${NC} $status_msg\033[K"
         echo -e "\033[J"
     else
-        echo -e "${R}${L_REPAIR}${NC} ${GR}»»»${NC} SECTOR: ${W}$r_sector${NC}\033[K"
-        local i_pend="${GR}[ ]${NC}" i_ok="${G}[OK]${NC}" i_fail="${R}[?]${NC}" i_try="${Y}[?]${NC}"
+        echo -e "${R}${L_REPAIR}${NC} ${GR}${BX_ARROW}${NC} SECTOR: ${W}$r_sector${NC}\033[K"
+        local i_pend="${GR}[ ]${NC}" i_ok="${G}[OK]${NC}" i_fail="${R}[${BX_FAIL}]${NC}" i_try="${Y}[?]${NC}"
         local v_read=$i_pend; [ "$st_read" -eq 1 ] && v_read=$i_ok; [ "$st_read" -eq 2 ] && v_read=$i_fail
         local v_resc=$i_pend; [ "$st_resc" -eq 1 ] && v_resc=$i_try; [ "$st_resc" -eq 2 ] && v_resc=$i_ok; [ "$st_resc" -eq 3 ] && v_resc=$i_fail
         local v_patch=$i_pend; [ "$st_patch" -eq 1 ] && v_patch=$i_ok; [ "$st_patch" -eq 2 ] && v_patch=$i_fail
-        local RHBAR; RHBAR=$(printf "%0.s${HZ}" $(seq 1 56))
-        echo -e "${B}${TL}${RHBAR}${TR}${NC}\033[K"
-        printf "${B}${VL}${NC} %-19b %-19b %-19b ${B}${VL}${NC}\033[K\n" "$v_read $L_PH_READ" "$v_resc $L_PH_RESC" "$v_patch $L_PH_ZERO"
-        echo -e "${B}${BL}${RHBAR}${BR}${NC}\033[K"
+        local RHBAR; RHBAR=$(printf "%0.s${BX_HZ2}" $(seq 1 56))
+        echo -e "${B}${BX_TL2}${RHBAR}${BX_TR2}${NC}\033[K"
+        printf "${B}${BX_VL2}${NC} %-19b %-19b %-19b ${B}${BX_VL2}${NC}\033[K\n" "$v_read $L_PH_READ" "$v_resc $L_PH_RESC" "$v_patch $L_PH_ZERO"
+        echo -e "${B}${BX_BL2}${RHBAR}${BX_BR2}${NC}\033[K"
         echo -e "${W}Status:${NC} $r_msg\033[K"
         echo -e "\033[J"
     fi
@@ -888,6 +905,11 @@ else
     echo -e "\n${C}Modo:${NC} reparación por bloques. Pasada de reparación cada ${CHUNK_PERCENT}% del disco."
 fi
 echo -e "${C}Timeout:${NC} kernel=${IO_TIMEOUT}s / operación=${OP_TIMEOUT}s"
+if [ "${USE_UNICODE:-0}" -eq 1 ]; then
+    echo -e "${C}Interfaz:${NC} Unicode (caja TUI)"
+else
+    echo -e "${C}Interfaz:${NC} ASCII (terminal sin soporte Unicode detectado)"
+fi
 
 # --- Detección de reanudación (antes del ENTER, para que el aviso sea visible) ---
 START_SECTOR=0
